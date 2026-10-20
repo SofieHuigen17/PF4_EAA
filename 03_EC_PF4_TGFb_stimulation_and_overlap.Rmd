@@ -1,0 +1,402 @@
+---
+title: "03 - PF4 and TGF-β stimulation of primary plaque endothelial cells, and integration with snRNA-seq"
+subtitle: "PF4 / EAA manuscript - Figures 4-5, Tables S11-S13"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_dir: "data/EC_stimulation"
+  counts_file: "EC_PF4_TGF_raw_counts.txt"     # genes (Ensembl ID) x samples, CEL-Seq2 UMI counts
+  donor_file: "donor_metadata.csv"             # columns: Donor, Sex
+  snrna_dir: "output/01_snRNAseq"              # outputs of 01_snRNAseq_EAA.Rmd
+  sn_padj_overlap: 0.05                        # adj. P cut-off for accelerated-EC genes in Fig. 5E
+  out_dir: "output/03_EC_stimulation"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+Plaque-derived endothelial cells (ECs) from five donors were stimulated for 144 h
+with PF4 (5 ng/mL), TGF-β1 (10 ng/mL) or left unstimulated (control), followed
+by bulk RNA-seq (CEL-Seq2 adapted protocol). The PF4- and TGF-β-responsive gene
+sets are then projected onto the plaque snRNA-seq data (notebook 01) and the
+spatial data (notebook 04).
+
+| Step | Section | Output |
+|---|---|---|
+| Count filtering, DESeq2 object, VST, PCA | 1-2 | Fig. 4B |
+| Differential expression (donor-adjusted DESeq2) | 3 | Fig. 4C, 4F, Tables S11-S12 |
+| Enrichment (Enrichr) | 4 | Fig. 4D-E, 4G-H, Table S13 |
+| PF4/TGF-β module scores in plaque snRNA-seq | 5 | Fig. 5A-D |
+| Overlap PF4-induced genes vs accelerated-plaque EC genes | 6 | Fig. 5E-F |
+
+Sample columns of the count matrix are named `<Condition>_<Timepoint>_<Donor>.sam.counts`.
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(DESeq2)        # v1.44.0
+  library(SummarizedExperiment)
+  library(limma)
+  library(org.Hs.eg.db)
+  library(Seurat)
+  library(tidyverse)
+  library(ggpubr)
+  library(EnhancedVolcano)
+  library(enrichR)
+  library(VennDiagram)
+  library(openxlsx)
+})
+source("R/helper_functions.R")
+
+set.seed(1234)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+fig_dir <- file.path(params$out_dir, "figures")
+tab_dir <- file.path(params$out_dir, "tables")
+dir.create(fig_dir, showWarnings = FALSE); dir.create(tab_dir, showWarnings = FALSE)
+```
+
+# 1. Read counts and build the DESeq2 object
+
+```{r read-counts}
+counts <- read.delim(file.path(params$data_dir, params$counts_file), header = TRUE)
+rownames(counts) <- counts[, 1]
+counts <- as.matrix(counts[, -1])
+
+sample_info <- do.call(rbind, strsplit(colnames(counts), split = "_"))
+coldata <- data.frame(Sample_name = colnames(counts),
+                      Condition   = sample_info[, 1],
+                      Timepoint   = sample_info[, 2],
+                      Donor       = paste0("AE", gsub(".sam.counts", "", sample_info[, 3], fixed = TRUE)))
+donors <- read.csv(file.path(params$data_dir, params$donor_file))
+coldata$Sex <- donors$Sex[match(coldata$Donor, donors$Donor)]
+coldata$Donor <- factor(coldata$Donor)
+table(coldata$Condition, coldata$Timepoint)
+
+# Remove genes with a total count <= 30 across all samples
+counts <- counts[rowSums(counts) > 30, ]
+dim(counts)
+
+RNA_EC <- SummarizedExperiment(assays = list(counts = counts), colData = coldata)
+
+# Ensembl -> gene symbol (Ensembl ID kept when no symbol is available)
+symbols <- mapIds(org.Hs.eg.db, keys = rownames(RNA_EC), column = "SYMBOL", keytype = "ENSEMBL")
+symbols[is.na(symbols)] <- rownames(RNA_EC)[is.na(symbols)]
+```
+
+# 2. Principal component analysis (Fig. 4B)
+
+Variance-stabilised counts (blind VST) of the T144 control, PF4 and TGF-β
+samples; donor effects removed with `limma::removeBatchEffect` for visualisation.
+
+```{r fig4b, fig.width=8, fig.height=5}
+dds_all <- DESeqDataSet(RNA_EC, design = ~ Donor + Condition)
+vsd <- vst(dds_all, blind = TRUE)
+
+vsd_sub <- vsd[, vsd$Timepoint == "T144" & vsd$Condition %in% c("Control", "TGF", "PF4")]
+mat_corrected <- removeBatchEffect(assay(vsd_sub), batch = vsd_sub$Donor)
+pca <- prcomp(t(mat_corrected), scale. = FALSE)
+percentVar <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+pca_df <- data.frame(pca$x[, 1:2], Condition = vsd_sub$Condition, Donor = vsd_sub$Donor)
+
+p4b <- ggplot(pca_df, aes(PC1, PC2, colour = Condition, fill = Condition)) +
+  geom_point(size = 4) +
+  stat_ellipse(geom = "polygon", alpha = 0.25, level = 0.95) +
+  scale_colour_manual(values = col_condition) + scale_fill_manual(values = col_condition) +
+  labs(x = paste0("PC1 (", percentVar[1], "%)"), y = paste0("PC2 (", percentVar[2], "%)")) +
+  theme_classic(base_size = 18) +
+  theme(legend.position = "top", legend.title = element_text(face = "bold"))
+save_fig(p4b, "Fig4B_PCA.png", 22, 14, fig_dir)
+p4b
+```
+
+# 3. Differential expression at T144 (Tables S11-S12)
+
+Each comparison is fitted on the two conditions involved with a donor-adjusted
+design (`~ Donor + Condition`). DEGs: FDR < 0.05 and |log2FC| >= 0.25.
+
+```{r deseq2}
+run_deseq <- function(treatment, reference) {
+  se <- RNA_EC[, RNA_EC$Timepoint == "T144" & RNA_EC$Condition %in% c(treatment, reference)]
+  se$Donor <- droplevels(se$Donor)
+  dds <- DESeq(DESeqDataSet(se, design = ~ Donor + Condition))
+  res <- results(dds, contrast = c("Condition", treatment, reference))
+  res$symbols <- symbols[rownames(res)]
+  res[order(res$padj), ]
+}
+
+res_list <- list(
+  PF4_vs_Control = run_deseq("PF4", "Control"),
+  TGF_vs_Control = run_deseq("TGF", "Control"),
+  PF4_vs_TGF     = run_deseq("PF4", "TGF"))
+saveRDS(res_list, file.path(params$out_dir, "DESeq2_results_T144.rds"))
+
+# Direction labels per comparison (positive log2FC = first condition)
+direction_labels <- list(PF4_vs_Control = c(up = "PF4_up", down = "Control_up"),
+                         TGF_vs_Control = c(up = "TGF_up", down = "Control_up"),
+                         PF4_vs_TGF     = c(up = "PF4_up", down = "TGF_up"))
+
+make_deg_table <- function(res, comparison) {
+  df <- as.data.frame(res) %>%
+    rownames_to_column("ensembl_id") %>%
+    filter(!is.na(symbols)) %>%
+    distinct(symbols, .keep_all = TRUE) %>%
+    mutate(Gene = symbols)
+  bind_rows(
+    df %>% filter(!is.na(padj), padj < 0.05, log2FoldChange >  0.25) %>%
+      mutate(Comparison = comparison, Direction = direction_labels[[comparison]][["up"]]),
+    df %>% filter(!is.na(padj), padj < 0.05, log2FoldChange < -0.25) %>%
+      mutate(Comparison = comparison, Direction = direction_labels[[comparison]][["down"]])) %>%
+    dplyr::select(Comparison, Direction, Gene, everything())
+}
+
+DEG_all <- bind_rows(lapply(names(res_list), function(n) make_deg_table(res_list[[n]], n)))
+summary_deg <- DEG_all %>% count(Comparison, Direction, name = "Number_of_DEGs")
+summary_deg
+```
+
+## Responsive gene sets used downstream
+
+```{r gene-sets}
+sig_genes <- function(res, direction = c("up", "down"), lfc = 0.25) {
+  direction <- match.arg(direction)
+  df <- as.data.frame(res)
+  keep <- df$padj < 0.05 & (if (direction == "up") df$log2FoldChange > lfc else df$log2FoldChange < -lfc)
+  unique(trimws(na.omit(df$symbols[keep])))
+}
+
+gene_sets <- list(
+  PF4_up_vs_control       = sig_genes(res_list$PF4_vs_Control, "up"),    # spatial PF4 score (notebook 04)
+  TGF_up_vs_control       = sig_genes(res_list$TGF_vs_Control, "up"),
+  PF4_specific_vs_TGF     = sig_genes(res_list$PF4_vs_TGF, "up"),        # PF4 module (Fig. 5A-B)
+  TGF_specific_vs_PF4     = sig_genes(res_list$PF4_vs_TGF, "down"))      # TGF-β module (Fig. 5C-D, notebook 04)
+lengths(gene_sets)
+saveRDS(gene_sets, file.path(params$out_dir, "responsive_gene_sets.rds"))
+```
+
+## Fig. 4C and 4F - volcano plots
+
+```{r fig4-volcano, fig.width=12, fig.height=7}
+volcano_bulk <- function(res, select_lab, down_col, ylim) {
+  df <- as.data.frame(res)
+  plot_volcano(df, x = "log2FoldChange", y = "padj", lab = df$symbols, select_lab = select_lab,
+               up_col = col_condition[["PF4"]], down_col = down_col, xlim = c(-4, 4), ylim = ylim,
+               ylab = bquote(-Log[10]~italic(adj.P)), label_size = 4, point_size = 2.5)
+}
+
+p4c <- volcano_bulk(res_list$PF4_vs_Control,
+                    c("NPPB", "CALD1", "COL4A1", "COL1A2", "IGFBP3", "ELN", "IL1RL1", "HMGA1", "CCNB2", "MYBL2", "TRBC2"),
+                    down_col = col_condition[["Control"]], ylim = c(0, 15))
+p4f <- volcano_bulk(res_list$PF4_vs_TGF,
+                    c("NQO1", "NDRG4", "ALDH1A3", "BMP4", "CD34", "FBN1", "KCNMB1", "SERPINE2", "ACTA2"),
+                    down_col = col_condition[["TGF"]], ylim = c(0, 30))
+save_fig(p4c, "Fig4C_volcano_PF4_vs_control.png", 16, 18, fig_dir)
+save_fig(p4f, "Fig4F_volcano_PF4_vs_TGF.png", 16, 18, fig_dir)
+cowplot::plot_grid(p4c, p4f)
+```
+
+# 4. Enrichment of PF4-induced genes (Fig. 4D-E, 4G-H, Table S13)
+
+DEGs (FDR < 0.05, |log2FC| > 0.25) of each direction were tested with Enrichr
+(gene sets with >= 5 genes), with all genes tested in the comparison as
+background.
+
+```{r enrichment}
+init_enrichr()
+db_labels <- c(GO_Molecular_Function_2025 = "GO_Molecular_Function", GO_Cellular_Component_2025 = "GO_Cellular_Component",
+               GO_Biological_Process_2025 = "GO_Biological_Process", Reactome_Pathways_2024 = "Reactome",
+               KEGG_2021_Human = "KEGG", MSigDB_Hallmark_2020 = "Hallmark")
+
+enrich_bulk <- list()
+enrichment_all <- list()
+for (cmp in names(res_list)) {
+  for (d in c("up", "down")) {
+    direction <- direction_labels[[cmp]][[d]]
+    genes <- DEG_all %>% filter(Comparison == cmp, Direction == direction) %>% pull(Gene)
+    if (length(genes) < 5) next
+    res <- run_enrichr(genes, background = res_list[[cmp]]$symbols)
+    enrich_bulk[[paste0(cmp, ifelse(d == "up", "_Up", "_Down"))]] <- res
+    enrichment_all[[paste(cmp, direction)]] <- bind_rows(lapply(names(db_labels), function(db) {
+      df <- as.data.frame(res[[db]])
+      if (nrow(df) == 0) return(NULL)
+      df %>% filter(P.value < 0.05) %>%
+        mutate(Comparison = cmp, Direction = direction, Database = db_labels[[db]]) %>%
+        dplyr::select(Comparison, Direction, Database, everything())
+    }))
+  }
+}
+enrichment_all <- bind_rows(enrichment_all)
+saveRDS(enrich_bulk, file.path(params$out_dir, "enrichr_EC_stimulation.rds"))
+
+# Tables S11-S13: DEGs and enrichment of the EC stimulation experiment
+summary_enrichment <- enrichment_all %>% count(Comparison, Direction, Database, name = "Number_of_Enriched_Terms")
+wb <- createWorkbook()
+sheets <- list(Summary_DEGs = summary_deg, Summary_Enrichment = summary_enrichment,
+               DEGs = DEG_all, Enrichment = enrichment_all)
+for (s in names(sheets)) {
+  addWorksheet(wb, s)
+  writeData(wb, s, sheets[[s]])
+  addStyle(wb, s, createStyle(textDecoration = "bold"), rows = 1, cols = 1:30, gridExpand = TRUE)
+  freezePane(wb, s, firstRow = TRUE)
+  setColWidths(wb, s, cols = 1:30, widths = "auto")
+}
+saveWorkbook(wb, file.path(tab_dir, "TablesS11-S13_EC_PF4_TGF_DEG_Enrichment.xlsx"), overwrite = TRUE)
+```
+
+Terms shown in the figure were selected from the full results (Table S13).
+
+```{r fig4-enrichment, fig.width=14, fig.height=10}
+# Fig. 4D - PF4 vs control, GO Biological Process
+pf4_bp <- enrich_bulk$PF4_vs_Control_Up$GO_Biological_Process_2025 %>% strip_go_id() %>%
+  filter(Term %in% c("Negative Regulation of Cell Migration", "Extracellular Matrix Organization",
+                     "Supramolecular Fiber Organization", "Collagen Fibril Organization",
+                     "Endodermal Cell Differentiation", "Negative Regulation of Smooth Muscle Cell Migration",
+                     "Transforming Growth Factor Beta Receptor Superfamily Signaling Pathway")) %>%
+  mutate(Term = recode(Term,
+    "Negative Regulation of Cell Migration" = "Cell migration",
+    "Extracellular Matrix Organization"     = "ECM organization",
+    "Supramolecular Fiber Organization"     = "Fiber organization",
+    "Collagen Fibril Organization"          = "Collagen fibrils",
+    "Endodermal Cell Differentiation"       = "Endoderm differentiation",
+    "Negative Regulation of Smooth Muscle Cell Migration" = "SMC migration",
+    "Transforming Growth Factor Beta Receptor Superfamily Signaling Pathway" = "TGF-β signaling"))
+p4d <- plot_enrichment(pf4_bp, title = "PF4 GO Biological Process", palette = "pf4")
+
+# Fig. 4E - PF4 vs control, MSigDB Hallmark
+pf4_hm <- enrich_bulk$PF4_vs_Control_Up$MSigDB_Hallmark_2020 %>%
+  filter(Term %in% c("Epithelial Mesenchymal Transition", "Apoptosis", "TNF-alpha Signaling via NF-kB",
+                     "Angiogenesis", "Coagulation", "Inflammatory Response", "TGF-beta Signaling")) %>%
+  mutate(Term = recode(Term,
+    "Epithelial Mesenchymal Transition" = "EMT",
+    "TNF-alpha Signaling via NF-kB"     = "TNF–NFκB signaling",
+    "Inflammatory Response"             = "Inflammation",
+    "TGF-beta Signaling"                = "TGF-β signaling"))
+p4e <- plot_enrichment(pf4_hm, title = "MSigDB Hallmark 2020", palette = "pf4", inside_n = 1)
+
+# Fig. 4G - PF4 vs TGF-β, GO Biological Process
+pt_bp <- enrich_bulk$PF4_vs_TGF_Up$GO_Biological_Process_2025 %>% strip_go_id() %>%
+  filter(Term %in% c("Regulation of Angiogenesis", "Regulation of Cell Migration",
+                     "Regulation of Smooth Muscle Cell Proliferation", "Endothelial Cell Proliferation",
+                     "Regulation of Canonical NF-kappaB Signal Transduction", "Inflammatory Response",
+                     "Leukocyte Cell-Cell Adhesion")) %>%
+  mutate(Term = recode(Term,
+    "Regulation of Angiogenesis"                     = "Angiogenesis",
+    "Regulation of Cell Migration"                   = "Cell migration",
+    "Regulation of Smooth Muscle Cell Proliferation" = "SMC proliferation",
+    "Endothelial Cell Proliferation"                 = "Endothelial proliferation",
+    "Regulation of Canonical NF-kappaB Signal Transduction" = "NF-κB signal",
+    "Inflammatory Response"                          = "Inflammation",
+    "Leukocyte Cell-Cell Adhesion"                   = "Leukocyte adhesion"))
+p4g <- plot_enrichment(pt_bp, title = "PF4 vs TGF-β GO Biological Process", palette = "pf4", inside_n = 2)
+
+# Fig. 4H - PF4 vs TGF-β, MSigDB Hallmark
+pt_hm <- enrich_bulk$PF4_vs_TGF_Up$MSigDB_Hallmark_2020 %>%
+  filter(Term %in% c("Interferon Gamma Response", "KRAS Signaling Up", "Hypoxia", "p53 Pathway",
+                     "IL-2/STAT5 Signaling", "TNF-alpha Signaling via NF-kB",
+                     "Epithelial Mesenchymal Transition", "Inflammatory Response")) %>%
+  mutate(Term = recode(Term,
+    "Interferon Gamma Response"         = "IFN-γ response",
+    "KRAS Signaling Up"                 = "KRAS signaling",
+    "p53 Pathway"                       = "p53 pathway",
+    "IL-2/STAT5 Signaling"              = "IL-2/STAT5 signaling",
+    "TNF-alpha Signaling via NF-kB"     = "TNF–NFκB signaling",
+    "Epithelial Mesenchymal Transition" = "EMT",
+    "Inflammatory Response"             = "Inflammation"))
+p4h <- plot_enrichment(pt_hm, title = "PF4 vs TGF-β MSigDB Hallmark 2020", palette = "pf4", inside_n = 6)
+
+save_fig(p4d, "Fig4D_enrich_PF4_GOBP.png", 20, 14, fig_dir)
+save_fig(p4e, "Fig4E_enrich_PF4_Hallmark.png", 16, 14, fig_dir)
+save_fig(p4g, "Fig4G_enrich_PF4vsTGF_GOBP.png", 18, 14, fig_dir)
+save_fig(p4h, "Fig4H_enrich_PF4vsTGF_Hallmark.png", 18, 14, fig_dir)
+cowplot::plot_grid(p4d, p4e, p4g, p4h, ncol = 2)
+```
+
+# 5. PF4- and TGF-β-responsive module scores in plaque snRNA-seq (Fig. 5A-D)
+
+Module scores (`Seurat::AddModuleScore`) for the genes specifically induced by
+PF4 relative to TGF-β (PF4 vs TGF-β, FDR < 0.05, log2FC > 0.25) and by TGF-β
+relative to PF4 (log2FC < -0.25). ECs from accelerated and decelerated plaques
+were compared with a Wilcoxon rank-sum test.
+
+```{r load-snrna}
+merged_plaque <- readRDS(file.path(params$snrna_dir, "seurat_8plaques_snRNAseq_annotated.rds"))
+deg_sn <- readRDS(file.path(params$snrna_dir, "DEG_MAST_cell_groups.rds"))
+
+merged_plaque <- AddModuleScore(merged_plaque, features = list(gene_sets$PF4_specific_vs_TGF), name = "PF4_module")
+merged_plaque <- AddModuleScore(merged_plaque, features = list(gene_sets$TGF_specific_vs_PF4), name = "TGF_module")
+```
+
+```{r fig5a-d, fig.width=14, fig.height=10}
+module_umap <- function(feature, legend_title) {
+  FeaturePlot(merged_plaque, features = feature, reduction = "umap.harmony", pt.size = 1.3, order = TRUE) +
+    scale_colour_gradientn(colours = c("#FFFFFF", "#E8DDF2", "#9B59B6", "#4A176A"), name = legend_title) +
+    ggtitle(NULL) + theme_classic(base_size = 20) +
+    theme(axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(),
+          legend.title = element_text(face = "bold", size = 20), legend.text = element_text(size = 16),
+          legend.key.height = unit(2, "cm"), legend.key.width = unit(0.8, "cm"))
+}
+
+module_box <- function(feature, ylab) {
+  df <- FetchData(subset(merged_plaque, subset = Cell_Group == "ECs"), vars = c(feature, "EAA.dich")) %>%
+    mutate(Group = factor(paste(EAA.dich, "ECs"), levels = c("Accelerated ECs", "Decelerated ECs")))
+  ggboxplot(df, x = "Group", y = feature, fill = "Group", add = "jitter", width = 0.7) +
+    scale_fill_manual(values = c("Accelerated ECs" = "#7E4D9E", "Decelerated ECs" = "#66C2A5")) +
+    stat_compare_means(method = "wilcox.test", size = 7) +
+    labs(x = NULL, y = ylab) +
+    theme_classic(base_size = 18) + theme(legend.position = "none")
+}
+
+p5a <- module_umap("PF4_module1", "PF4-specific\nmodule score")
+p5b <- module_box("PF4_module1", "Module Score PF4 genes")
+p5c <- module_umap("TGF_module1", "TGF-specific\nmodule score")
+p5d <- module_box("TGF_module1", "Module Score TGF genes")
+
+save_fig(p5a, "Fig5A_UMAP_PF4_module.png", 8, 6, fig_dir, units = "in")
+save_fig(p5b, "Fig5B_box_PF4_module_ECs.png", 8, 6, fig_dir, units = "in")
+save_fig(p5c, "Fig5C_UMAP_TGF_module.png", 8, 6, fig_dir, units = "in")
+save_fig(p5d, "Fig5D_box_TGF_module_ECs.png", 8, 6, fig_dir, units = "in")
+cowplot::plot_grid(p5a, p5b, p5c, p5d, ncol = 2)
+```
+
+# 6. Overlap of PF4-induced genes with genes upregulated in accelerated-plaque ECs (Fig. 5E-F)
+
+PF4-induced genes (PF4 vs control, FDR < 0.05, log2FC > 0) were intersected
+with genes upregulated in ECs from accelerated plaques (snRNA-seq MAST,
+adjusted P < `r params$sn_padj_overlap`, log2FC > 0). Enrichment of the overlap was assessed with a
+one-sided Fisher's exact test, using all genes tested in the snRNA-seq EC
+comparison (plus both gene sets) as universe.
+
+```{r overlap}
+pf4_up_all <- sig_genes(res_list$PF4_vs_Control, "up", lfc = 0)
+ec_acc_up  <- rownames(deg_sn$ECs)[deg_sn$ECs$p_val_adj < params$sn_padj_overlap & deg_sn$ECs$avg_log2FC > 0]
+
+ov <- overlap_fisher(pf4_up_all, ec_acc_up, universe = rownames(deg_sn$ECs))
+ov$table
+ov$test$p.value
+overlap_table <- deg_sn$ECs[ov$overlap, ] %>% rownames_to_column("gene") %>%
+  left_join(as.data.frame(res_list$PF4_vs_Control) %>%
+              dplyr::select(gene = symbols, bulk_log2FC_PF4 = log2FoldChange, bulk_padj_PF4 = padj),
+            by = "gene")
+write.xlsx(overlap_table, file.path(tab_dir, "Overlap_PF4_bulk_vs_ECs_accelerated.xlsx"))
+overlap_table
+```
+
+```{r fig5e, fig.width=8, fig.height=6}
+venn <- venn.diagram(x = list(PF4_up = pf4_up_all, ECs_Accelerated = ec_acc_up),
+                     category.names = c("", ""), filename = NULL,
+                     fill = c("#4A176A", "#C59AD8"), alpha = 0.5, cex = 6, fontface = "bold",
+                     fontfamily = "sans", cat.fontfamily = "sans", bg = "white")
+png(file.path(fig_dir, "Fig5E_venn_PF4_ECs_accelerated.png"), width = 25, height = 20, units = "cm", res = 300)
+grid::grid.draw(venn); dev.off()
+grid::grid.newpage(); grid::grid.draw(venn)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

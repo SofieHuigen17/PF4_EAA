@@ -1,0 +1,265 @@
+---
+title: "02 - Plaque proteomics associated with epigenetic age acceleration"
+subtitle: "PF4 / EAA manuscript - Figure 3, Tables S9-S10"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_dir: "data/proteomics"
+  proteomics_file: "plaque_proteomics_EAA.rds"   # patients x (clinical + protein) data frame
+  first_protein_col: 83                          # first protein column in that data frame
+  bulk_rna_file: "plaque_bulkRNA_expression.rds" # patients x genes, log2 normalised (Fig. 3F)
+  out_dir: "output/02_proteomics"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+Proteome-wide association analysis between plaque ECM-enriched proteomics
+(n = 108 Athero-Express plaques; 1,499 quantified proteins) and plaque
+epigenetic age acceleration (EAA).
+
+| Step | Section | Output |
+|---|---|---|
+| Per-protein linear regression (EAA ~ protein + age + sex) | 1 | Fig. 3A, Table S9 |
+| Enrichment of EAA-associated proteins (Enrichr) | 2 | Fig. 3B-C, Table S10 |
+| PF4 abundance vs EAA | 3 | Fig. 3D-E |
+| PF4 in the plaque bulk transcriptome | 4 | Fig. 3F |
+
+**Input data.** Proteomics were pre-processed as described in the Methods
+(Proteome Discoverer 2.5/Mascot; normalisation to total protein abundance,
+log2 transformation, removal of proteins with > 30% missing values, KNN
+imputation). The input is a data frame with one row per patient containing
+`STUDY_NUMBER`, `Age`, `Sex`, `EAA` (continuous), `EAA.dich`
+(Decelerated/Accelerated) and the protein abundances from column
+`params$first_protein_col` onwards. These data are not publicly shared (see
+README).
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggpubr)
+  library(EnhancedVolcano)
+  library(enrichR)
+  library(openxlsx)
+})
+source("R/helper_functions.R")
+
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+fig_dir <- file.path(params$out_dir, "figures")
+tab_dir <- file.path(params$out_dir, "tables")
+dir.create(fig_dir, showWarnings = FALSE); dir.create(tab_dir, showWarnings = FALSE)
+```
+
+```{r load-data}
+all_data_proteomics <- readRDS(file.path(params$data_dir, params$proteomics_file))
+all_data_proteomics$EAA <- as.numeric(all_data_proteomics$EAA)
+
+prot <- all_data_proteomics %>% filter(!is.na(EAA))
+prot$EAA.dich <- factor(prot$EAA.dich, levels = c("Decelerated", "Accelerated"))
+
+# Protein columns only (exclude any identifier / EAA columns in this range)
+protein_cols <- setdiff(colnames(prot)[params$first_protein_col:ncol(prot)],
+                        c("STUDY_NUMBER", "EAA", "EAA.dich"))
+length(protein_cols)   # 1,499 proteins
+table(prot$EAA.dich)   # accelerated n = 53, decelerated n = 55
+```
+
+# 1. Proteome-wide association scan (Fig. 3A, Table S9)
+
+For each protein, EAA was regressed on the normalised log2 protein abundance,
+adjusted for chronological age and sex. P values were corrected across all
+proteins with the Benjamini-Hochberg procedure. Proteins with nominal P < 0.05
+were considered associated with EAA for exploratory analyses.
+
+```{r association-scan}
+regression_results <- bind_rows(lapply(protein_cols, function(p) {
+  fit <- lm(EAA ~ protein + Age + Sex, data = data.frame(prot[, c("EAA", "Age", "Sex")],
+                                                          protein = as.numeric(prot[[p]])))
+  co <- summary(fit)$coefficients["protein", ]
+  data.frame(Protein = p, Slope = co[["Estimate"]], SE = co[["Std. Error"]], P_Value = co[["Pr(>|t|)"]])
+}))
+regression_results$Adjusted_P_Value <- p.adjust(regression_results$P_Value, method = "BH")
+regression_results <- arrange(regression_results, P_Value)
+
+saveRDS(regression_results, file.path(params$out_dir, "regression_results_EAA_proteins.rds"))
+
+# Table S9: nominally significant proteins (accelerated = positive slope)
+table_s9 <- regression_results %>%
+  filter(P_Value < 0.05) %>%
+  mutate(Direction = ifelse(Slope > 0, "Accelerated", "Decelerated"),
+         Slope = round(Slope, 3),
+         P_Value = signif(P_Value, 3),
+         Adjusted_P_Value = signif(Adjusted_P_Value, 3)) %>%
+  dplyr::select(Protein, Direction, Slope, P_Value, Adjusted_P_Value) %>%
+  arrange(P_Value)
+
+write_supp_table <- function(sheets, file) {
+  wb <- createWorkbook()
+  for (s in names(sheets)) {
+    addWorksheet(wb, s)
+    writeData(wb, s, sheets[[s]])
+    addStyle(wb, s, createStyle(textDecoration = "bold", halign = "center", border = "Bottom"),
+             rows = 1, cols = seq_len(ncol(sheets[[s]])), gridExpand = TRUE)
+    setColWidths(wb, s, cols = seq_len(ncol(sheets[[s]])), widths = "auto")
+    freezePane(wb, s, firstRow = TRUE)
+  }
+  saveWorkbook(wb, file, overwrite = TRUE)
+}
+write_supp_table(list(`Significant Results` = table_s9), file.path(tab_dir, "TableS9_proteins_EAA.xlsx"))
+table(table_s9$Direction)
+```
+
+```{r fig3a, fig.width=7, fig.height=8}
+p3a <- plot_volcano(regression_results, x = "Slope", y = "P_Value", lab = regression_results$Protein,
+                    select_lab = c("PF4", "CFHR5", "F13A1", "SPP2", "EIF3A", "ANXA1", "ADH5", "CD109"),
+                    fc_cut = 0, up_col = "#7E4D9E", down_col = "#66C2A5",
+                    xlim = c(-4, 4), xlab = "Slope", ylab = expression(-Log[10]~italic(P)))
+save_fig(p3a, "Fig3A_volcano_proteins_EAA.png", 16, 20, fig_dir)
+p3a
+```
+
+# 2. Enrichment of proteins positively associated with EAA (Fig. 3B-C, Table S10)
+
+Proteins positively associated with EAA (P < 0.05, slope > 0) were tested with
+Enrichr, using all quantified proteins as background.
+
+```{r enrichment}
+init_enrichr()
+pos_assoc <- regression_results$Protein[regression_results$Slope > 0 & regression_results$P_Value < 0.05]
+neg_assoc <- regression_results$Protein[regression_results$Slope < 0 & regression_results$P_Value < 0.05]
+
+enrich_pos <- run_enrichr(pos_assoc, background = regression_results$Protein)
+enrich_neg <- run_enrichr(neg_assoc, background = regression_results$Protein)
+
+# Table S10: terms with nominal P < 0.05
+db_labels <- c(GO_Molecular_Function_2025 = "GO_Molecular_Function", GO_Cellular_Component_2025 = "GO_Cellular_Component",
+               GO_Biological_Process_2025 = "GO_Biological_Process", Reactome_Pathways_2024 = "Reactome",
+               KEGG_2021_Human = "KEGG", MSigDB_Hallmark_2020 = "Hallmark")
+make_enrichment_table <- function(res, direction) {
+  bind_rows(lapply(names(db_labels), function(db) {
+    df <- as.data.frame(res[[db]])
+    if (nrow(df) == 0) return(NULL)
+    df %>% filter(P.value < 0.05) %>%
+      mutate(Direction = direction, Database = db_labels[[db]]) %>%
+      dplyr::select(Direction, Database, everything())
+  }))
+}
+enrichment_prot <- bind_rows(make_enrichment_table(enrich_pos, "Accelerated"),
+                             make_enrichment_table(enrich_neg, "Decelerated"))
+summary_prot <- enrichment_prot %>% count(Direction, Database, name = "Number_of_Enriched_Terms")
+write_supp_table(list(Summary = summary_prot, Enrichment = enrichment_prot),
+                 file.path(tab_dir, "TableS10_enrichment_proteins_EAA.xlsx"))
+```
+
+Terms shown in the figure were selected from the full results (Table S10).
+
+```{r fig3bc, fig.width=14, fig.height=6}
+go_bp <- enrich_pos$GO_Biological_Process_2025 %>% strip_go_id() %>%
+  filter(Term %in% c("Inflammatory Response", "Neutrophil Chemotaxis",
+                     "Negative Regulation of Wound Healing", "Granulocyte Chemotaxis",
+                     "Neutrophil Migration", "Mammary Gland Epithelium Development",
+                     "Vascular Endothelial Growth Factor Signaling Pathway")) %>%
+  mutate(Term = recode(Term,
+    "Inflammatory Response"                = "Inflammatory response",
+    "Neutrophil Chemotaxis"                = "Neutrophil chemotaxis",
+    "Negative Regulation of Wound Healing" = "Wound healing",
+    "Granulocyte Chemotaxis"               = "Granulocyte chemotaxis",
+    "Neutrophil Migration"                 = "Neutrophil migration",
+    "Mammary Gland Epithelium Development" = "Mammary epithelium",
+    "Vascular Endothelial Growth Factor Signaling Pathway" = "VEGF signaling"))
+p3b <- plot_enrichment(go_bp, title = "GO Biological Process", inside_n = 5)
+
+reactome <- enrich_pos$Reactome_Pathways_2024 %>%
+  filter(Term %in% c("NCAM1 Interactions", "Platelet Degranulation",
+                     "Integrin Cell Surface Interactions", "Response to Elevated Platelet Cytosolic Ca2+",
+                     "Signaling by PDGF", "Collagen Formation",
+                     "Platelet Activation, Signaling and Aggregation", "Hemostasis")) %>%
+  mutate(Term = recode(Term,
+    "NCAM1 Interactions"                             = "NCAM1 interactions",
+    "Platelet Degranulation"                         = "Platelet degranulation",
+    "Integrin Cell Surface Interactions"             = "Integrin interactions",
+    "Response to Elevated Platelet Cytosolic Ca2+"   = "Platelet Ca²⁺ response",
+    "Signaling by PDGF"                              = "PDGF signaling",
+    "Collagen Formation"                             = "Collagen formation",
+    "Platelet Activation, Signaling and Aggregation" = "Platelet activation"))
+p3c <- plot_enrichment(reactome, title = "Reactome",
+                       inside_terms = c("Platelet degranulation", "Integrin interactions",
+                                        "Platelet Ca²⁺ response", "Platelet activation", "Hemostasis"))
+
+save_fig(p3b, "Fig3B_enrich_GOBP.png", 20, 18, fig_dir)
+save_fig(p3c, "Fig3C_enrich_Reactome.png", 20, 18, fig_dir)
+cowplot::plot_grid(p3b, p3c)
+```
+
+# 3. PF4 abundance and EAA (Fig. 3D-E)
+
+```{r fig3de, fig.width=10, fig.height=5}
+# Accelerated plaques were not normally distributed (Shapiro-Wilk) -> Wilcoxon test
+tapply(prot$PF4, prot$EAA.dich, function(x) shapiro.test(x)$p.value)
+wilcox.test(PF4 ~ EAA.dich, data = prot)
+
+# Association with continuous EAA, adjusted for age and sex
+summary(lm(PF4 ~ EAA + Age + Sex, data = prot))
+
+p3d <- ggplot(prot, aes(x = EAA.dich, y = PF4, fill = EAA.dich)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA) +
+  scale_fill_manual(values = col_EAA) +
+  stat_compare_means(method = "wilcox.test", label = "p.format") +
+  labs(x = "", y = "Normalized PF4 units") +
+  theme_classic(base_size = 18) +
+  theme(legend.position = "none", axis.text = element_text(size = 18))
+
+p3e <- ggplot(prot, aes(x = EAA, y = PF4)) +
+  geom_point(size = 2.5, alpha = 0.8, colour = "#8152A2") +
+  geom_smooth(method = "lm", colour = "black", se = TRUE) +
+  labs(x = "Epigenetic Age Acceleration", y = "Normalized PF4 units") +
+  theme_classic(base_size = 18)
+
+save_fig(p3d, "Fig3D_boxplot_PF4_EAA.png", 12, 16, fig_dir)
+save_fig(p3e, "Fig3E_scatter_PF4_EAA.png", 16, 15, fig_dir)
+cowplot::plot_grid(p3d, p3e)
+```
+
+# 4. PF4 in the plaque bulk transcriptome (Fig. 3F)
+
+Genes were ranked by their median normalised expression across all plaques
+(unexpressed genes removed) and divided into five equally sized quintiles; the
+position of *PF4* is highlighted.
+
+```{r fig3f, fig.width=8, fig.height=5}
+bulk_expr <- readRDS(file.path(params$data_dir, params$bulk_rna_file))
+bulk_expr <- bulk_expr[, vapply(bulk_expr, is.numeric, logical(1)), drop = FALSE]
+
+gene_median <- data.frame(Gene = colnames(bulk_expr),
+                          Expression = apply(bulk_expr, 2, median, na.rm = TRUE)) %>%
+  filter(Expression > 0) %>%
+  arrange(Expression) %>%
+  mutate(Group = cut(seq_len(n()), breaks = 5, labels = paste0("Q", 1:5)))
+pf4_row <- filter(gene_median, Gene == "PF4")
+pf4_row
+
+p3f <- ggplot(gene_median, aes(Group, Expression)) +
+  geom_violin(fill = "grey90", colour = NA, trim = TRUE) +
+  geom_boxplot(width = 0.12, outlier.shape = NA) +
+  geom_point(data = pf4_row, colour = "#7B3294", size = 4) +
+  geom_text(data = pf4_row, aes(label = "PF4"), colour = "#7B3294", fontface = "bold",
+            nudge_x = 0.12, nudge_y = 0.05, hjust = 0, size = 5) +
+  scale_y_continuous(expand = c(0.02, 0.08)) +
+  labs(x = "Expression quintile", y = "Median normalized expression") +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+save_fig(p3f, "Fig3F_PF4_expression_quintile.png", 22, 15, fig_dir)
+p3f
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

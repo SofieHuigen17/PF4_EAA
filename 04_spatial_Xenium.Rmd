@@ -1,0 +1,400 @@
+---
+title: "04 - Spatial distribution of PF4- and TGF-β-responsive endothelial programmes (Xenium)"
+subtitle: "PF4 / EAA manuscript - Figure 6, Supplementary Figures S10-S16"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  xenium_file: "data/spatial/Panel1_cells_scale_10_asg_conf_0.75_final_data.h5ad"  # Pauli et al.
+  gene_set_file: "output/03_EC_stimulation/responsive_gene_sets.rds"
+  lumen_dir: "lumen_annotation"     # manually drawn lumen boundaries + per-sample cut-offs
+  redraw_lumen: false               # TRUE = redo the interactive lumen annotation
+  out_dir: "output/04_spatial"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+The publicly available Xenium dataset of Pauli *et al.* (ref. 21; panel 1,
+4 control arteries and 12 carotid plaques) was used to study where in the
+plaque the PF4- and TGF-β-responsive EC programmes defined in notebook 03 are
+expressed.
+
+| Step | Section | Output |
+|---|---|---|
+| Cell types per sample | 1 | Fig. S10 |
+| PF4 / TGF-β module scores | 2 | |
+| Lumen boundary, distance to lumen, luminal-adjacent ECs | 3 | Fig. S11-S12, Fig. 6A |
+| Spatial module-score maps | 4 | Fig. 6B, Fig. S13-S14 |
+| Cell-level comparison per sample | 5 | Fig. S15-S16 |
+| Sample-level paired comparison | 6 | Fig. 6C |
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(zellkonverter)
+  library(SingleCellExperiment)
+  library(RANN)
+  library(tidyverse)
+  library(ggpubr)
+  library(scales)
+})
+source("R/helper_functions.R")
+
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+fig_dir <- file.path(params$out_dir, "figures")
+dir.create(fig_dir, showWarnings = FALSE)
+```
+
+```{r load-data}
+panel1 <- readH5AD(params$xenium_file)
+gene_sets <- readRDS(params$gene_set_file)
+
+# ECs as defined by the published low-level annotation
+endo_idx <- panel1$final_low_level_celltype %in% c("EC_1", "EC_2")
+
+samples <- as.character(unique(panel1$original_sample))
+sample_order  <- c(samples[grepl("_Ctrl$", samples)], samples[grepl("_Pl$", samples)])
+sample_labels <- setNames(sample_order %>%
+                            gsub("Panel1_P([0-9]+)_Ctrl", "Control \\1", .) %>%
+                            gsub("Panel1_P([0-9]+)_Pl", "Plaque \\1", .),
+                          sample_order)
+sample_labels
+```
+
+# 1. Cell types per sample (Fig. S10)
+
+```{r figS11}
+celltype_cols <- c(
+  "CD8_Teff-cell" = "#377EB8", "Endothelial" = "#E41A1C", "Inflammatory_mixed_cell" = "#FFB000",
+  "Macrophage" = "#984EA3", "Mast-cell" = "#FF7F00", "Neutrophil" = "#4DAF4A",
+  "Plasma-cell" = "#00CFC1", "VSMC" = "lightpink")
+
+png(file.path(fig_dir, "FigS10_all_celltypes.png"), width = 4000, height = 4000, res = 600)
+layout(matrix(c(1:16, rep(17, 4)), nrow = 5, byrow = TRUE))
+par(mar = c(0.8, 0.8, 2, 0.8))
+for (s in sample_order) {
+  idx <- panel1$original_sample == s
+  plot(panel1$x_um[idx], -panel1$y_um[idx], type = "n", asp = 1, axes = FALSE,
+       xlab = "", ylab = "", main = sample_labels[s], cex.main = 0.9)
+  for (ct in names(celltype_cols)) {
+    ct_idx <- idx & panel1$final_high_level_celltype == ct
+    points(panel1$x_um[ct_idx], -panel1$y_um[ct_idx], pch = 16, cex = 0.23, col = celltype_cols[ct])
+  }
+}
+par(mar = c(0, 0, 0, 0)); plot.new()
+legend("center", legend = names(celltype_cols), col = celltype_cols, pch = 16,
+       pt.cex = 2, cex = 1.4, ncol = 2, bty = "n")
+dev.off()
+```
+
+# 2. PF4 and TGF-β module scores
+
+Only responsive genes present in the Xenium panel can be used: 14 PF4-responsive
+genes (PF4 vs control, FDR < 0.05, log2FC > 0.25) and 26 TGF-β-responsive genes
+(TGF-β vs PF4, FDR < 0.05, log2FC > 0.25). Per patient, area-normalised
+expression of each gene was z-scored across all cells; the module score of a
+cell is the mean z-score across the genes in the set.
+
+```{r module-scores}
+module_score <- function(sce, genes) {
+  ensg <- rownames(sce)[rowData(sce)$HGNC %in% genes]
+  message(length(ensg), " genes found in the panel: ", paste(rowData(sce)[ensg, "HGNC"], collapse = ", "))
+  expr <- assays(sce)$norm_by_area[ensg, , drop = FALSE]
+  score <- rep(NA_real_, ncol(sce))
+  for (pat in unique(sce$patient)) {
+    cells <- which(sce$patient == pat)
+    z <- t(scale(t(as.matrix(expr[, cells, drop = FALSE]))))
+    score[cells] <- colMeans(z, na.rm = TRUE)
+  }
+  score
+}
+
+panel1$PF4_score <- module_score(panel1, gene_sets$PF4_up_vs_control)    # 14 genes
+panel1$TGF_score <- module_score(panel1, gene_sets$TGF_specific_vs_PF4)  # 26 genes
+```
+
+# 3. Lumen boundary and luminal-adjacent ECs (Fig. S11-S12, Fig. 6A)
+
+The lumen boundary of each sample was traced manually on the spatial
+coordinates (`locator()`), and for every EC the distance to the nearest
+boundary point was computed. Because distance distributions differ between
+samples, the cut-off was set per sample at the separation in the distance
+histogram (Fig. S11). ECs closer than the cut-off are *lumen-adjacent*.
+
+The traced boundaries and cut-offs used in the manuscript are provided in
+`lumen_annotation/` so that the classification is fully reproducible without
+redrawing. Set `params$redraw_lumen = TRUE` to repeat the interactive annotation
+(requires an interactive graphics device; not run when knitting).
+
+```{r draw-lumen, eval=params$redraw_lumen}
+lumen_boundaries <- list()
+cutoffs <- data.frame(sample = character(), cutoff = numeric())
+
+for (s in sample_order) {
+  repeat {
+    idx <- panel1$original_sample == s
+    plot(panel1$x_um[idx], panel1$y_um[idx], pch = 16, cex = 0.4, col = "grey80", asp = 1,
+         main = paste("Draw lumen boundary:", s))
+    points(panel1$x_um[idx & endo_idx], panel1$y_um[idx & endo_idx], pch = 16, cex = 0.5, col = "purple")
+    message("Draw the lumen boundary; press Esc / right-click to finish")
+    boundary <- locator(type = "l")
+    if (is.null(boundary)) break
+    boundary <- cbind(boundary$x, boundary$y)
+
+    d <- nn2(boundary, cbind(panel1$x_um[idx & endo_idx], panel1$y_um[idx & endo_idx]), k = 1)$nn.dists[, 1]
+    hist(d, breaks = 50, main = paste("Distance to lumen:", s), xlab = "Distance to lumen boundary (µm)")
+    cutoff <- as.numeric(readline(paste0("Lumen cut-off for ", s, " (µm): ")))
+    if (tolower(readline("Redo this sample? (y/n): ")) != "y") {
+      lumen_boundaries[[s]] <- boundary
+      cutoffs <- rbind(cutoffs, data.frame(sample = s, cutoff = cutoff))
+      break
+    }
+  }
+}
+dir.create(params$lumen_dir, showWarnings = FALSE)
+saveRDS(lumen_boundaries, file.path(params$lumen_dir, "lumen_boundaries.rds"))
+write.csv(cutoffs, file.path(params$lumen_dir, "lumen_cutoffs.csv"), row.names = FALSE)
+```
+
+```{r classify-ecs}
+lumen_boundaries <- readRDS(file.path(params$lumen_dir, "lumen_boundaries.rds"))
+cutoffs <- read.csv(file.path(params$lumen_dir, "lumen_cutoffs.csv"))
+cutoffs
+
+panel1$dist_to_lumen <- NA_real_
+panel1$lumen_cutoff  <- NA_real_
+panel1$luminal_EC    <- FALSE
+for (s in names(lumen_boundaries)) {
+  ec_idx <- panel1$original_sample == s & endo_idx
+  d <- nn2(lumen_boundaries[[s]], cbind(panel1$x_um[ec_idx], panel1$y_um[ec_idx]), k = 1)$nn.dists[, 1]
+  cut <- cutoffs$cutoff[cutoffs$sample == s]
+  panel1$dist_to_lumen[ec_idx] <- d
+  panel1$lumen_cutoff[ec_idx]  <- cut
+  panel1$luminal_EC[ec_idx]    <- d < cut
+}
+
+ec_table <- data.frame(Sample = panel1$original_sample, Luminal = panel1$luminal_EC)[endo_idx, ]
+table(ec_table$Sample, ec_table$Luminal)
+```
+
+## Fig. S11 - Distance-to-lumen histograms with per-sample cut-offs
+
+```{r figS11}
+breaks <- seq(0, ceiling(max(panel1$dist_to_lumen, na.rm = TRUE)) + 2, by = 2)
+y_max <- ceiling(1.1 * max(sapply(sample_order, function(s) {
+  d <- na.omit(panel1$dist_to_lumen[panel1$original_sample == s & endo_idx])
+  if (length(d)) max(hist(d, breaks = breaks, plot = FALSE)$counts) else 0
+})))
+
+png(file.path(fig_dir, "FigS11_lumen_distance_histograms.png"), width = 5000, height = 5000, res = 600)
+par(mfrow = c(4, 4), mar = c(3, 3.2, 2.2, 1), mgp = c(1.8, 0.6, 0), tcl = -0.25, bty = "l", las = 1)
+for (s in sample_order) {
+  idx <- panel1$original_sample == s & endo_idx
+  hist(na.omit(panel1$dist_to_lumen[idx]), breaks = breaks, col = "grey75", border = "white",
+       main = sample_labels[s], xlab = "Distance to lumen boundary (µm)", ylab = "Number of ECs",
+       xlim = range(breaks), ylim = c(0, y_max), cex.lab = 0.9, cex.axis = 0.8)
+  cut <- cutoffs$cutoff[cutoffs$sample == s]
+  if (length(cut) == 1) {
+    abline(v = cut, lty = 2, lwd = 2)
+    text(cut, y_max * 0.92, paste0("Cutoff = ", cut, " µm"), pos = 4, cex = 0.75)
+  }
+}
+dev.off()
+```
+
+## Fig. S12 and Fig. 6A - Lumen-adjacent vs non-lumen-adjacent ECs
+
+```{r figS12-6a}
+plot_luminal <- function(s, cex_bg = 0.12, cex_ec = 0.45) {
+  idx <- panel1$original_sample == s
+  ec_idx <- idx & endo_idx
+  plot(panel1$x_um[idx], -panel1$y_um[idx], pch = 16, cex = cex_bg, col = "grey90", asp = 1,
+       axes = FALSE, xlab = "", ylab = "", main = sample_labels[s], cex.main = 0.9)
+  points(panel1$x_um[ec_idx & !panel1$luminal_EC], -panel1$y_um[ec_idx & !panel1$luminal_EC],
+         pch = 16, cex = cex_ec, col = col_location[["Non-lumen-adjacent ECs"]])
+  points(panel1$x_um[ec_idx & panel1$luminal_EC], -panel1$y_um[ec_idx & panel1$luminal_EC],
+         pch = 16, cex = cex_ec, col = col_location[["Lumen-adjacent ECs"]])
+  if (s %in% names(lumen_boundaries)) {
+    lines(lumen_boundaries[[s]][, 1], -lumen_boundaries[[s]][, 2], col = "black", lwd = 1)
+  }
+}
+luminal_legend <- function() {
+  par(mar = c(0, 0, 0, 0)); plot.new()
+  legend("center", legend = c(names(col_location), "Lumen boundary"),
+         col = c(col_location, "black"), pch = c(16, 16, NA), lty = c(NA, NA, 1),
+         pt.cex = 1.5, cex = 0.9, bty = "n", horiz = TRUE, xpd = TRUE)
+}
+
+png(file.path(fig_dir, "FigS12_luminal_EC_classification.png"), width = 4000, height = 4300, res = 600)
+layout(matrix(c(1:16, rep(17, 4)), nrow = 5, byrow = TRUE), heights = c(rep(1, 4), 0.22))
+par(mar = c(0.8, 0.8, 2, 0.8), xaxs = "i", yaxs = "i")
+for (s in sample_order) plot_luminal(s)
+luminal_legend()
+dev.off()
+
+for (s in c("Panel1_P11_Pl", "Panel1_P12_Pl")) {
+  png(file.path(fig_dir, paste0("Fig6A_luminal_EC_", gsub(" ", "_", sample_labels[s]), ".png")),
+      width = 4000, height = 4300, res = 600)
+  layout(matrix(1:2, nrow = 2), heights = c(1, 0.15))
+  par(mar = c(0.8, 0.8, 2, 0.8), xaxs = "i", yaxs = "i")
+  plot_luminal(s, cex_bg = 1, cex_ec = 1.5)
+  luminal_legend()
+  dev.off()
+}
+```
+
+# 4. Spatial maps of module scores (Fig. 6B, Fig. S13-S14)
+
+For visualisation only, the top 1% highest-scoring ECs per sample were removed
+to limit the influence of extreme values on the colour scale. All statistical
+tests (sections 5-6) use the complete data.
+
+```{r score-scales}
+score_scales <- list(
+  PF4_score = list(limits = c(-0.5, 2.5), breaks = c(-0.5, -0.2, 0, 0.5, 1.2, 2.5), label = "PF4 score"),
+  TGF_score = list(limits = c(-0.5, 1.2), breaks = c(-0.5, -0.3, 0, 0.4, 0.9, 1.2), label = "TGF-β score"))
+score_cols <- c("#2166AC", "#67A9CF", "lightyellow", "#FDD835", "#F16913", "#B30000")
+
+trim_top_ecs <- function(sce, score, q = 0.99) {
+  meta <- as.data.frame(colData(sce)) %>%
+    mutate(cell_id = colnames(sce), is_EC = final_low_level_celltype %in% c("EC_1", "EC_2"))
+  keep <- meta %>% group_by(original_sample) %>%
+    mutate(cut = quantile(.data[[score]][is_EC], q, na.rm = TRUE)) %>%
+    filter(!is_EC | .data[[score]] <= cut) %>% pull(cell_id)
+  sce[, keep]
+}
+
+plot_score_map <- function(sce, s, score) {
+  sc <- score_scales[[score]]
+  idx <- sce$original_sample == s
+  ec_idx <- idx & sce$final_low_level_celltype %in% c("EC_1", "EC_2")
+  ggplot() +
+    geom_point(aes(x = sce$x_um[idx], y = -sce$y_um[idx]), colour = "grey90", size = 1.2) +
+    geom_point(aes(x = sce$x_um[ec_idx], y = -sce$y_um[ec_idx], colour = sce[[score]][ec_idx]), size = 3.2) +
+    scale_colour_gradientn(colours = score_cols, values = rescale(sc$breaks, from = sc$limits),
+                           limits = sc$limits, oob = squish, name = sc$label) +
+    coord_fixed() + labs(title = sample_labels[s]) +
+    theme_classic(base_size = 18) +
+    theme(axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(),
+          axis.line = element_blank(), plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.title = element_text(face = "bold"))
+}
+
+clean <- list(PF4_score = trim_top_ecs(panel1, "PF4_score"),
+              TGF_score = trim_top_ecs(panel1, "TGF_score"))
+```
+
+```{r fig6b-s13-s14}
+# Fig. 6B - plaque 11 and 12, PF4 score
+for (s in c("Panel1_P11_Pl", "Panel1_P12_Pl")) {
+  save_fig(plot_score_map(clean$PF4_score, s, "PF4_score"),
+           paste0("Fig6B_PF4_score_", gsub("Panel1_", "", s), ".png"), 10, 10, fig_dir, units = "in", dpi = 600)
+}
+
+# Fig. S13 (PF4) and S14 (TGF-β) - Control 1-4 and Plaque 1-10
+# (plaques 11 and 12 are shown in Fig. 6B)
+map_samples <- sample_order[1:14]
+for (score in names(score_scales)) {
+  maps <- lapply(map_samples, function(s) {
+    plot_score_map(clean[[score]], s, score) + theme(legend.position = "none", plot.title = element_text(size = 10))
+  })
+  save_fig(ggarrange(plotlist = maps, ncol = 4, nrow = 4, common.legend = TRUE, legend = "bottom",
+                     legend.grob = get_legend(plot_score_map(clean[[score]], sample_order[1], score))),
+           paste0(if (score == "PF4_score") "FigS13" else "FigS14", "_spatial_", score, ".png"),
+           16, 16, fig_dir, units = "in")
+}
+```
+
+# 5. Cell-level comparison per sample (Fig. S15-S16)
+
+Within each sample, scores of lumen-adjacent and non-lumen-adjacent ECs were
+compared with a Wilcoxon rank-sum test on all ECs; box plots show the trimmed
+data (section 4).
+
+```{r figS15-16}
+score_box <- function(s, score) {
+  full <- data.frame(Score = panel1[[score]], Luminal = panel1$luminal_EC)[panel1$original_sample == s & endo_idx, ]
+  ci <- clean[[score]]
+  plot_df <- data.frame(Score = ci[[score]], Luminal = ci$luminal_EC)[
+    ci$original_sample == s & ci$final_low_level_celltype %in% c("EC_1", "EC_2"), ]
+  lab <- function(x) factor(ifelse(x, "Lumen-adjacent ECs", "Non-lumen-adjacent ECs"), levels = names(col_location))
+  full$Location <- lab(full$Luminal); plot_df$Location <- lab(plot_df$Luminal)
+
+  if (length(unique(full$Location)) < 2) return(ggplot() + theme_void() + labs(title = sample_labels[s]))
+  p <- wilcox.test(Score ~ Location, data = full)$p.value
+  ggplot(plot_df, aes(Location, Score, fill = Location)) +
+    geom_boxplot(width = 0.6, outlier.shape = NA) +
+    geom_jitter(width = 0.12, size = 1.8, alpha = 0.7) +
+    annotate("text", x = 1.5, y = max(plot_df$Score, na.rm = TRUE) * 1.08,
+             label = paste0("p = ", format.pval(p, digits = 3, eps = 0.001)), size = 5) +
+    scale_fill_manual(values = col_location) +
+    labs(x = "", y = score_scales[[score]]$label, title = sample_labels[s]) +
+    theme_classic(base_size = 16) +
+    theme(legend.position = "none", axis.text.x = element_text(size = 10, angle = 25, hjust = 1),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+for (score in names(score_scales)) {
+  save_fig(ggarrange(plotlist = lapply(sample_order, score_box, score = score), ncol = 4, nrow = 4, align = "hv"),
+           paste0(if (score == "PF4_score") "FigS15" else "FigS16", "_boxplots_", score, "_per_sample.png"),
+           22, 25, fig_dir, units = "in", dpi = 600)
+}
+```
+
+# 6. Sample-level paired comparison (Fig. 6C)
+
+To account for differences in the number of ECs per sample, the median score of
+lumen-adjacent and non-lumen-adjacent ECs was calculated per sample and the two
+were compared with a paired Wilcoxon signed-rank test (sample = unit of
+observation), separately for control arteries (n = 4) and plaques (n = 12).
+
+```{r fig6c, fig.width=14, fig.height=6}
+df_sample <- data.frame(Sample = as.character(panel1$original_sample), PF4 = panel1$PF4_score,
+                        TGF = panel1$TGF_score, Luminal = panel1$luminal_EC)[endo_idx, ] %>%
+  mutate(Group = ifelse(grepl("_Ctrl$", Sample), "Control", "Plaque"),
+         Location = factor(ifelse(Luminal, "Lumen-adjacent ECs", "Non-lumen-adjacent ECs"),
+                           levels = names(col_location))) %>%
+  group_by(Sample, Group, Location) %>%
+  summarise(PF4 = median(PF4, na.rm = TRUE), TGF = median(TGF, na.rm = TRUE), .groups = "drop") %>%
+  pivot_longer(c(PF4, TGF), names_to = "Module", values_to = "Score") %>%
+  mutate(Panel = factor(paste(Group, Module),
+                        levels = c("Plaque PF4", "Plaque TGF", "Control PF4", "Control TGF")))
+
+p_values <- df_sample %>%
+  group_by(Panel) %>%
+  summarise(p_value = {
+    w <- pivot_wider(pick(Sample, Location, Score), names_from = Location, values_from = Score) %>% drop_na()
+    wilcox.test(w$`Lumen-adjacent ECs`, w$`Non-lumen-adjacent ECs`, paired = TRUE)$p.value
+  }, y = max(Score, na.rm = TRUE) * 1.10, .groups = "drop") %>%
+  mutate(p_label = paste0("p = ", format.pval(p_value, digits = 2, eps = 0.001)))
+p_values
+
+p6c <- ggplot(df_sample, aes(Location, Score, fill = Location)) +
+  geom_line(aes(group = Sample), colour = "grey60", linewidth = 0.7, alpha = 0.7) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.04, size = 3, alpha = 0.9) +
+  geom_text(data = p_values, aes(x = 1.5, y = y, label = p_label), inherit.aes = FALSE, size = 8) +
+  facet_grid(. ~ Panel, scales = "free_y",
+             labeller = labeller(Panel = c("Plaque PF4" = "Plaque PF4", "Plaque TGF" = "Plaque TGF-β",
+                                           "Control PF4" = "Control PF4", "Control TGF" = "Control TGF-β"))) +
+  scale_fill_manual(values = col_location) +
+  labs(x = "", y = "Sample-level median score") +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "bottom", legend.title = element_blank(), legend.text = element_text(size = 18),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.text = element_text(face = "bold", size = 20),
+        strip.background = element_rect(colour = "black", fill = NA, linewidth = 0.8))
+save_fig(p6c, "Fig6C_sample_level_PF4_TGF_luminal.png", 18, 8, fig_dir, units = "in", dpi = 600)
+p6c
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

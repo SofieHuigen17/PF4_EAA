@@ -1,0 +1,20 @@
+# Patient-level data are NOT shared in this repository
+data/
+output/
+*.rds
+!lumen_annotation/lumen_boundaries.rds
+*.RData
+*.h5ad
+*.xlsx
+*.mtx
+*.mtx.gz
+*.tsv.gz
+
+# R / RStudio
+.Rhistory
+.Rproj.user/
+.RData
+*_cache/
+*_files/
+*.html
+VennDiagram*.log

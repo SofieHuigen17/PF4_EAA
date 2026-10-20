@@ -1,0 +1,861 @@
+---
+title: "01 - Single-nucleus RNA-seq of carotid plaques stratified by epigenetic age acceleration"
+subtitle: "PF4 / EAA manuscript - Figures 1-2, Supplementary Figures S1-S9, Tables S5-S8"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_dir: "data/snRNAseq"        # CeleScope output folders + sample_metadata.csv
+  ref_dir: "data/reference"        # Pan et al. human plaque scRNA-seq reference (.rds)
+  out_dir: "output/01_snRNAseq"
+  run_slow_steps: true             # JackStraw / clustree / DoubletFinder sweep
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This notebook reproduces the single-nucleus RNA-seq (snRNA-seq) analysis of
+eight carotid endarterectomy plaques (Athero-Express Biobank), stratified by
+plaque epigenetic age acceleration (EAA; accelerated n = 3, decelerated n = 5).
+
+| Step | Section | Output |
+|---|---|---|
+| Read CeleScope matrices, QC filtering | 1-3 | Fig. S1-S2 |
+| Doublet removal (DoubletFinder) | 4 | Fig. S3 |
+| PC selection (JackStraw), clustering resolution (clustree) | 5 | Fig. S4-S5 |
+| Harmony integration and clustering | 6 | Fig. S6 |
+| Cell-type annotation (markers, SingleR/HPCA, Pan et al. reference) | 7 | Table S2-S3 |
+| EAA metadata, cell groups, composition | 8-9 | Fig. 1, Fig. S7, Table S1 |
+| Differential expression (MAST) per cell group | 10 | Fig. 2, Fig. S8-S9, Table S5 |
+| Functional enrichment (Enrichr) | 11 | Fig. 2, Table S6 |
+| Pseudobulk sensitivity analysis | 12 | Tables S7-S8 |
+
+The objects saved here (final Seurat object and the cell-group DEG tables) are
+used in `03_EC_PF4_TGFb_stimulation_and_overlap.Rmd`.
+
+**Input data.** Raw snRNA-seq data are not publicly shared (see README, *Data
+availability*). `sample_metadata.csv` is expected in `params$data_dir` with one
+row per plaque and the columns:
+`sample_id, label, folder, sex, batch, age, age_horvath, EAA, EAA_dich, bmi, diabetes`
+(`label` = anonymous patient label used in figures, P1-P8).
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(Seurat)          # v5.3.0
+  library(DoubletFinder)   # v2.0.6
+  library(harmony)
+  library(clustree)
+  library(SingleR)
+  library(celldex)
+  library(scuttle)
+  library(MAST)
+  library(Matrix)
+  library(tidyverse)
+  library(ggpubr)
+  library(gghalves)
+  library(EnhancedVolcano)
+  library(enrichR)
+  library(openxlsx)
+  library(tableone)
+  library(ggalluvial)
+  library(patchwork)
+})
+source("R/helper_functions.R")
+
+set.seed(1234)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+fig_dir <- file.path(params$out_dir, "figures")
+tab_dir <- file.path(params$out_dir, "tables")
+dir.create(fig_dir, showWarnings = FALSE); dir.create(tab_dir, showWarnings = FALSE)
+```
+
+# 1. Read CeleScope count matrices
+
+Raw reads were processed with CeleScope v2.9.0 against GRCh38 (Ensembl 99).
+Two output layouts exist (older runs: `matrix.mtx/genes.tsv`; newer runs:
+gzipped `features.tsv.gz`), both handled below. Duplicated gene symbols are made
+unique by appending `-1`, `-2`, ... to the second and later occurrences.
+
+```{r read-data}
+sample_meta <- read.csv(file.path(params$data_dir, "sample_metadata.csv"),
+                        stringsAsFactors = FALSE)
+
+dedup_symbols <- function(x) {
+  n <- ave(seq_along(x), x, FUN = seq_along) - 1
+  ifelse(n == 0, x, paste0(x, "-", n))
+}
+
+read_celescope <- function(dir, sample_id) {
+  gz <- file.exists(file.path(dir, "matrix.mtx.gz"))
+  counts   <- readMM(file.path(dir, if (gz) "matrix.mtx.gz" else "matrix.mtx"))
+  features <- read.delim(file.path(dir, if (gz) "features.tsv.gz" else "genes.tsv"), header = FALSE)
+  barcodes <- read.delim(file.path(dir, if (gz) "barcodes.tsv.gz" else "barcodes.tsv"), header = FALSE)
+  rownames(counts) <- dedup_symbols(features[, 2])
+  colnames(counts) <- barcodes[, 1]
+  obj <- CreateSeuratObject(as(counts, "CsparseMatrix"), project = sample_id,
+                            min.cells = 1, min.features = 1)
+  obj$patient <- sample_id
+  obj
+}
+
+plaque_list <- lapply(seq_len(nrow(sample_meta)), function(i) {
+  read_celescope(file.path(params$data_dir, sample_meta$folder[i]), sample_meta$sample_id[i])
+})
+
+plaque <- merge(plaque_list[[1]], y = plaque_list[-1],
+                add.cell.ids = paste0("R", seq_len(nrow(sample_meta)), "_", sample_meta$sample_id),
+                project = "plaques_AE")
+dim(plaque)
+```
+
+# 2. Quality-control metrics (Fig. S1)
+
+```{r qc-metrics}
+plaque <- PercentageFeatureSet(plaque, pattern = "^MT-",     col.name = "percent_mito")
+plaque <- PercentageFeatureSet(plaque, pattern = "^RP[SL]",  col.name = "percent_ribo")
+plaque <- PercentageFeatureSet(plaque, pattern = "^HB[^(P)]", col.name = "percent_hb")
+
+# Anonymous patient labels (P1-P8) used in all figures
+plaque$patient_label <- factor(sample_meta$label[match(plaque$patient, sample_meta$sample_id)],
+                               levels = paste0("P", 1:8))
+
+qc_feats  <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo", "percent_hb")
+qc_labels <- c("Detected genes", "UMI counts", "Mitochondrial RNA (%)",
+               "Ribosomal RNA (%)", "Hemoglobin genes (%)")
+
+qc_violins <- function(obj) {
+  p <- VlnPlot(obj, group.by = "patient_label", features = qc_feats, pt.size = 0, ncol = 3) + NoLegend()
+  for (i in seq_along(qc_feats)) {
+    p[[i]] <- p[[i]] + labs(title = qc_labels[i], x = NULL) +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  }
+  p
+}
+
+p_qc_pre <- qc_violins(plaque)
+save_fig(p_qc_pre, "FigS1_QC_violin_unfiltered.png", 10, 8, fig_dir, units = "in")
+p_qc_pre
+```
+
+# 3. Cell and gene filtering (Fig. S2)
+
+Nuclei with 200-3,000 detected genes and < 0.2% mitochondrial reads were kept.
+Genes with > 3 counts in at least one sample were kept; *MALAT1* and
+mitochondrial genes were removed.
+
+```{r filtering}
+plaque <- subset(plaque, subset = nFeature_RNA > 200 & nFeature_RNA < 3000)
+
+count_layers <- Layers(plaque, search = "counts")
+keep_genes <- unique(unlist(lapply(count_layers, function(l) {
+  rownames(plaque)[Matrix::rowSums(LayerData(plaque, layer = l)) > 3]
+})))
+plaque <- subset(plaque, features = keep_genes)
+
+plaque <- subset(plaque, cells = WhichCells(plaque, expression = percent_mito < 0.2))
+
+p_qc_post <- qc_violins(plaque)
+save_fig(p_qc_post, "FigS2_QC_violin_filtered.png", 10, 8, fig_dir, units = "in")
+
+plaque <- plaque[!grepl("MALAT1", rownames(plaque)), ]
+plaque <- plaque[!grepl("^MT-", rownames(plaque)), ]
+dim(plaque)
+p_qc_post
+```
+
+# 4. Doublet removal (Fig. S3)
+
+Log-normalisation (scale factor 10,000), 2,000 highly variable genes (VST),
+scaling and PCA, followed by DoubletFinder with an expected doublet rate of 4%.
+
+```{r doublets}
+merged_plaque <- NormalizeData(plaque)
+merged_plaque <- FindVariableFeatures(merged_plaque, selection.method = "vst", nfeatures = 2000)
+merged_plaque <- ScaleData(merged_plaque, features = rownames(merged_plaque))
+merged_plaque <- RunPCA(merged_plaque)
+merged_plaque <- RunUMAP(merged_plaque, dims = 1:20)
+merged_plaque <- JoinLayers(merged_plaque)
+
+if (params$run_slow_steps) {
+  # pK identification without ground truth (diagnostic)
+  sweep.res   <- paramSweep(merged_plaque)
+  sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+  bcmvn       <- find.pK(sweep.stats)
+  barplot(bcmvn$BCmetric, names.arg = bcmvn$pK, las = 2)
+}
+
+nExp <- round(ncol(merged_plaque) * 0.04)
+merged_plaque <- doubletFinder(merged_plaque, pN = 0.25, pK = 0.02, nExp = nExp, PCs = 1:10)
+DF.name <- grep("^DF.classifications", colnames(merged_plaque@meta.data), value = TRUE)
+
+p_dbl <- cowplot::plot_grid(ncol = 2,
+  DimPlot(merged_plaque, group.by = "patient_label") + NoAxes(),
+  DimPlot(merged_plaque, group.by = DF.name) + NoAxes())
+save_fig(p_dbl, "FigS3_doublets.png", 12, 8, fig_dir, units = "in")
+
+doublet_table <- as.data.frame.matrix(table(merged_plaque$patient_label, merged_plaque[[DF.name]][, 1]))
+doublet_table$Doublet_pct <- round(100 * doublet_table$Doublet / rowSums(doublet_table), 2)
+write.xlsx(doublet_table, file.path(tab_dir, "doublets_per_patient.xlsx"), rowNames = TRUE)
+doublet_table
+
+merged_plaque <- merged_plaque[, merged_plaque[[DF.name]][, 1] == "Singlet"]
+dim(merged_plaque)   # 8,097 nuclei retained
+saveRDS(merged_plaque, file.path(params$out_dir, "seurat_8plaques_qc.rds"))
+```
+
+# 5. Number of PCs (Fig. S4) and clustering resolution (Fig. S5)
+
+```{r pcs-resolution}
+merged_plaque <- RunPCA(merged_plaque, npcs = 100, verbose = FALSE)
+
+if (params$run_slow_steps) {
+  merged_plaque <- JackStraw(merged_plaque, num.replicate = 100, dims = 30)
+  merged_plaque <- ScoreJackStraw(merged_plaque, dims = 1:30)
+  p_pcs <- cowplot::plot_grid(JackStrawPlot(merged_plaque, dims = 1:30),
+                              ElbowPlot(merged_plaque, ndims = 30), ncol = 2, rel_widths = c(1.5, 0.8))
+  save_fig(p_pcs, "FigS4_JackStraw_Elbow.png", 12, 8, fig_dir, units = "in")
+}
+# Based on JackStraw and elbow plot: PCs 1-20
+
+merged_plaque <- NormalizeData(merged_plaque)
+merged_plaque <- FindVariableFeatures(merged_plaque)
+merged_plaque <- ScaleData(merged_plaque, features = rownames(merged_plaque))
+merged_plaque <- RunPCA(merged_plaque)
+merged_plaque <- FindNeighbors(merged_plaque, dims = 1:20, reduction = "pca")
+
+if (params$run_slow_steps) {
+  for (res in seq(0.1, 1.3, by = 0.1)) merged_plaque <- FindClusters(merged_plaque, resolution = res)
+  p_tree <- clustree(merged_plaque, prefix = "RNA_snn_res.", node_size = "size",
+                     edge_alpha = 0.5, edge_width = 0.8, layout = "tree") +
+    theme_bw(base_size = 16) + theme(panel.grid = element_blank(), legend.text = element_text(size = 16))
+  save_fig(p_tree, "FigS5_clustree.png", 14, 12, fig_dir, units = "in")
+}
+# Resolution 0.9 selected based on cluster stability (clustree)
+
+# Distribution of patients across the (non-integrated) clusters at resolution 0.9
+if ("RNA_snn_res.0.9" %in% colnames(merged_plaque@meta.data)) {
+  dist_before <- as.data.frame(table(Cluster = merged_plaque$RNA_snn_res.0.9,
+                                     Patient = merged_plaque$patient_label))
+  n_per_cluster <- tapply(dist_before$Freq, dist_before$Cluster, sum)
+  p_dist <- ggplot(dist_before, aes(x = Cluster, y = Freq, fill = Patient)) +
+    geom_bar(stat = "identity", position = "fill") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_x_discrete(labels = paste0(names(n_per_cluster), "\n(n=", n_per_cluster, ")")) +
+    labs(title = "Cluster Distribution Across Patients", x = "Cluster", y = "Proportion of Cells") +
+    theme_classic(base_size = 16) +
+    theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+          axis.title = element_text(face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1))
+  save_fig(p_dist, "Cluster_distribution_before_integration.png", 8, 10, fig_dir, units = "in")
+}
+```
+
+# 6. Harmony integration and clustering
+
+```{r harmony}
+merged_plaque$Sex <- sample_meta$sex[match(merged_plaque$patient, sample_meta$sample_id)]
+
+merged_plaque <- NormalizeData(merged_plaque, verbose = FALSE)
+merged_plaque <- FindVariableFeatures(merged_plaque, verbose = FALSE)
+merged_plaque <- ScaleData(merged_plaque, features = rownames(merged_plaque))
+merged_plaque <- RunPCA(merged_plaque, npcs = 20, verbose = FALSE)
+merged_plaque <- RunUMAP(merged_plaque, dims = 1:20, reduction = "pca",
+                         reduction.name = "umap.unintegrated")
+
+# Harmony with sample (patient) as batch variable
+merged_plaque[["RNA"]] <- split(merged_plaque[["RNA"]], f = merged_plaque$patient)
+options(future.globals.maxSize = 3 * 1024^3)
+merged_plaque <- IntegrateLayers(merged_plaque, method = HarmonyIntegration,
+                                 orig.reduction = "pca", new.reduction = "integrated.harmony",
+                                 verbose = FALSE)
+merged_plaque <- FindNeighbors(merged_plaque, reduction = "integrated.harmony", dims = 1:20)
+merged_plaque <- FindClusters(merged_plaque, resolution = 0.9, cluster.name = "harmony_clusters")
+merged_plaque <- RunUMAP(merged_plaque, reduction = "integrated.harmony", dims = 1:20,
+                         reduction.name = "umap.harmony")
+merged_plaque <- JoinLayers(merged_plaque)
+
+cowplot::plot_grid(
+  DimPlot(merged_plaque, reduction = "umap.unintegrated", group.by = "patient_label") + NoAxes() + ggtitle("Before Harmony"),
+  DimPlot(merged_plaque, reduction = "umap.harmony", group.by = "patient_label") + NoAxes() + ggtitle("After Harmony"))
+```
+
+## Fig. S6 - Contribution of patients to the clusters
+
+```{r figS6, fig.width=14, fig.height=7}
+p_s6a <- DimPlot(merged_plaque, reduction = "umap.harmony", group.by = "patient_label", pt.size = 0.3) +
+  theme_classic(base_size = 22) + ggtitle("")
+
+cluster_flow <- merged_plaque@meta.data %>% count(patient_label, harmony_clusters, name = "n")
+p_s6b <- ggplot(cluster_flow, aes(axis1 = patient_label, axis2 = harmony_clusters, y = n)) +
+  geom_alluvium(aes(fill = patient_label), width = 0.2, alpha = 0.8) +
+  geom_stratum(width = 0.25, colour = "black") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 6) +
+  scale_x_discrete(limits = c("Patient", "Cluster"), expand = c(0.05, 0.05)) +
+  labs(y = "Number of Cells") +
+  theme_classic(base_size = 22) + theme(legend.position = "none")
+
+save_fig(p_s6a, "FigS6A_UMAP_patients.png", 10, 10, fig_dir, units = "in")
+save_fig(p_s6b, "FigS6B_patient_cluster_flow.png", 10, 10, fig_dir, units = "in")
+p_s6a + p_s6b
+```
+
+# 7. Cell-type annotation
+
+## 7a. Cluster markers (Wilcoxon; min.pct 0.25, log2FC 0.25)
+
+```{r markers}
+Idents(merged_plaque) <- "harmony_clusters"
+plaque_markers <- FindAllMarkers(merged_plaque, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.xlsx(plaque_markers, file.path(tab_dir, "cluster_markers_harmony.xlsx"))
+```
+
+## 7b. SingleR with the Human Primary Cell Atlas (celldex)
+
+Fine labels are consolidated into broader cell classes (text before the first
+`:`), and the predicted labels are tabulated per cluster.
+
+```{r singler-hpca}
+ref_hpca <- celldex::HumanPrimaryCellAtlasData(ensembl = FALSE)
+sce <- as.SingleCellExperiment(merged_plaque)
+pred_hpca <- SingleR(test = sce, ref = ref_hpca, labels = ref_hpca$label.fine)
+merged_plaque$SingleR_HPCA <- sub(":.*", "", pred_hpca$labels)
+
+hpca_per_cluster <- prop.table(table(merged_plaque$harmony_clusters, merged_plaque$SingleR_HPCA), 1) * 100
+write.xlsx(as.data.frame.matrix(round(hpca_per_cluster, 2)),
+           file.path(tab_dir, "SingleR_HPCA_per_cluster.xlsx"), rowNames = TRUE)
+```
+
+## 7c. Reference-based annotation with a published human plaque scRNA-seq dataset
+
+Aggregated reference profiles were generated from the author-provided labels of
+the Pan *et al.* human carotid plaque scRNA-seq dataset (ref. 17).
+
+```{r singler-pan}
+pan_human <- readRDS(file.path(params$ref_dir, "Pan_et_al_human.rds"))
+pan_sce   <- as.SingleCellExperiment(pan_human)
+pan_aggr  <- aggregateReference(pan_sce, labels = pan_sce$Author_Provided, rank = 20)
+
+pred_pan <- SingleR(test = LayerData(merged_plaque, layer = "counts"), ref = pan_aggr,
+                    assay.type.test = 1, labels = pan_aggr$label)
+merged_plaque$SingleR_Pan <- pred_pan$labels
+
+pan_per_cluster <- prop.table(table(merged_plaque$harmony_clusters, merged_plaque$SingleR_Pan), 1) * 100
+write.xlsx(as.data.frame.matrix(round(pan_per_cluster, 2)),
+           file.path(tab_dir, "SingleR_Pan_per_cluster.xlsx"), rowNames = TRUE)
+plotScoreHeatmap(pred_pan, clusters = merged_plaque$harmony_clusters)
+```
+
+## 7d. Final cluster identities
+
+Final identities were assigned manually based on the reference predictions above,
+established lineage markers and the cluster marker genes (section 7a).
+
+```{r final-annotation}
+cluster_ids <- c(
+  "0"  = "ACTA2+MYH9+ contractile SMCs 1",
+  "1"  = "ACTA2+RYR2+ contractile SMCs 2",
+  "2"  = "ACTA2+VCAN+ contractile SMCs 3",
+  "3"  = "CD163+ Resident-like macrophages",
+  "4"  = "CD163+ Foam-like macrophages",
+  "5"  = "CD34+ Neovessel ECs",
+  "6"  = "CD96+CD247+ T cells",
+  "7"  = "ACTA2+NRG3+ SMCs",
+  "8"  = "CNTNAP2+ Neuron-like cells",
+  "9"  = "ACTA2+ Myofibroblast-like SMCs",
+  "10" = "CD34+ Luminal ECs",
+  "11" = "ACTA2+TBX2+ SMCs")
+
+merged_plaque$Cell_Types <- factor(unname(cluster_ids[as.character(merged_plaque$harmony_clusters)]),
+                                   levels = unname(cluster_ids))
+
+# Broad cell groups used for differential expression
+merged_plaque$Cell_Group <- case_when(
+  grepl("SMCs", merged_plaque$Cell_Types)        ~ "SMCs",
+  grepl("ECs", merged_plaque$Cell_Types)         ~ "ECs",
+  grepl("macrophages", merged_plaque$Cell_Types) ~ "Macrophages",
+  TRUE ~ as.character(merged_plaque$Cell_Types))
+table(merged_plaque$Cell_Types, merged_plaque$Cell_Group)
+```
+
+# 8. Add plaque epigenetic age and clinical metadata
+
+Plaque epigenetic age (Horvath clock, `cgageR`) and EAA (residual of epigenetic
+age regressed on chronological age) were derived from HM450k DNA methylation
+data as described previously (ref. 15). Sequencing batch: two samples were
+sequenced in a later run.
+
+```{r add-metadata}
+m <- match(merged_plaque$patient, sample_meta$sample_id)
+merged_plaque$EAA         <- sample_meta$EAA[m]
+merged_plaque$EAA.dich    <- factor(sample_meta$EAA_dich[m], levels = c("Decelerated", "Accelerated"))
+merged_plaque$age.horvath <- sample_meta$age_horvath[m]
+merged_plaque$Age         <- sample_meta$age[m]
+merged_plaque$BMI         <- sample_meta$bmi[m]
+merged_plaque$Diabetes    <- sample_meta$diabetes[m]
+merged_plaque$batch       <- sample_meta$batch[m]
+
+merged_plaque$CellGroup_EAA <- paste(merged_plaque$Cell_Group, merged_plaque$EAA.dich, sep = "_")
+
+saveRDS(merged_plaque, file.path(params$out_dir, "seurat_8plaques_snRNAseq_annotated.rds"))
+```
+
+# 9. Figure 1 - Epigenetic age and cellular composition
+
+## Table S1 - Baseline characteristics
+
+```{r table-s1}
+tab1 <- CreateTableOne(vars = c("age", "sex", "bmi", "diabetes", "age_horvath", "EAA_dich"),
+                       data = sample_meta, factorVars = c("sex", "diabetes", "EAA_dich"))
+print(tab1)
+range(sample_meta$EAA)
+```
+
+## Fig. 1A-C - Plaque epigenetic age, chronological age, EAA
+
+```{r fig1-abc, fig.width=12, fig.height=5}
+half_violin <- function(df, y, ylab) {
+  ggplot(df, aes(x = "", y = .data[[y]])) +
+    geom_half_violin(side = "r", alpha = 0.35, fill = "#8DA0CB", colour = NA, trim = FALSE) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, fill = "#8DA0CB", colour = "black") +
+    geom_jitter(width = 0.08, alpha = 0.6, size = 3) +
+    labs(x = "", y = ylab) +
+    theme_classic(base_size = 25) +
+    theme(axis.text = element_text(colour = "black"),
+          axis.text.x = element_blank(), axis.ticks.x = element_blank())
+}
+
+p1a <- half_violin(sample_meta, "age_horvath", "Epigenetic Age (years)")
+p1c <- half_violin(sample_meta, "EAA", "Epigenetic Age Acceleration (years)")
+
+cor.test(sample_meta$age, sample_meta$age_horvath, method = "pearson")
+p1b <- ggplot(sample_meta, aes(x = age, y = age_horvath)) +
+  geom_smooth(method = "lm", se = TRUE, colour = "black", linetype = "dashed", fill = "grey90") +
+  geom_point(size = 5, alpha = 0.7, colour = "#8DA0CB") +
+  labs(x = "Chronological Age (years)", y = "Epigenetic Age (years)") +
+  theme_classic(base_size = 25) +
+  theme(axis.text = element_text(colour = "black"))
+
+save_fig(p1a, "Fig1A_epigenetic_age.png", 12, 16, fig_dir)
+save_fig(p1b, "Fig1B_chron_vs_epigenetic_age.png", 14, 14, fig_dir)
+save_fig(p1c, "Fig1C_EAA.png", 12, 16, fig_dir)
+cowplot::plot_grid(p1a, p1b, p1c, nrow = 1)
+```
+
+## Fig. 1D-E - UMAPs
+
+```{r fig1-de, fig.width=14, fig.height=7}
+Idents(merged_plaque) <- "Cell_Types"
+p1d <- DimPlot(merged_plaque, reduction = "umap.harmony", pt.size = 0.5) +
+  xlab("UMAP Harmony 1") + ylab("UMAP Harmony 2") +
+  theme(axis.title = element_text(size = 16), legend.position = "none")
+p1d <- LabelClusters(p1d, id = "ident", repel = TRUE, size = 5, box.padding = 0.5)
+
+p1e_groups <- DimPlot(merged_plaque, reduction = "umap.harmony", group.by = "Cell_Group", pt.size = 0.5) +
+  xlab("UMAP Harmony 1") + ylab("UMAP Harmony 2") + ggtitle(NULL) +
+  theme(axis.title = element_text(size = 14), legend.position = "none")
+p1e_groups <- LabelClusters(p1e_groups, id = "Cell_Group", repel = TRUE, size = 7, box.padding = 0.5)
+
+p1e_eaa <- DimPlot(merged_plaque, reduction = "umap.harmony", group.by = "EAA.dich",
+                   cols = col_EAA, pt.size = 0.5) +
+  xlab("UMAP Harmony 1") + ylab("UMAP Harmony 2") + ggtitle(NULL) +
+  theme(axis.title = element_text(size = 16), legend.text = element_text(size = 20)) +
+  guides(colour = guide_legend(override.aes = list(size = 10)))
+
+save_fig(p1d, "Fig1D_UMAP_celltypes.png", 28, 20, fig_dir)
+save_fig(p1e_groups, "Fig1E_UMAP_cellgroups.png", 20, 20, fig_dir)
+save_fig(p1e_eaa, "Fig1E_UMAP_EAA.png", 21, 20, fig_dir)
+p1d
+```
+
+## Fig. 1F - Cell-type composition by EAA status
+
+Per-patient percentages of each cell type; bars show the mean and 95% CI
+(1.96 x SE) per EAA group.
+
+```{r fig1f, fig.width=14, fig.height=8}
+cell_counts <- as.data.frame(table(Patient = merged_plaque$patient,
+                                   Cell_Type = merged_plaque$Cell_Types)) %>%
+  group_by(Patient) %>%
+  mutate(Percentage = Freq / sum(Freq) * 100) %>%
+  ungroup() %>%
+  mutate(EAA_Status = sample_meta$EAA_dich[match(Patient, sample_meta$sample_id)])
+
+summary_df <- cell_counts %>%
+  group_by(Cell_Type, EAA_Status) %>%
+  summarise(mean_prop = mean(Percentage), sd_prop = sd(Percentage), n = n(),
+            ci95 = 1.96 * sd_prop / sqrt(n), .groups = "drop") %>%
+  mutate(Cell_Type = fct_reorder(str_wrap(Cell_Type, 20), mean_prop, .desc = TRUE))
+
+p1f <- ggplot(summary_df, aes(x = Cell_Type, y = mean_prop, fill = EAA_Status)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.9) +
+  geom_errorbar(aes(ymin = mean_prop - ci95, ymax = mean_prop + ci95),
+                position = position_dodge(width = 0.8), width = 0.3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05)), breaks = seq(0, 50, 5),
+                     labels = function(x) paste0(x, "%")) +
+  scale_fill_manual(values = col_EAA) +
+  labs(x = "", y = "Mean Percentage per Patient ± 95% CI") +
+  theme_classic(base_size = 22) +
+  theme(text = element_text(colour = "black"),
+        axis.text.x = element_text(size = 20, angle = 60, hjust = 1, vjust = 1, colour = "black"),
+        axis.text.y = element_text(size = 22, colour = "black"),
+        legend.title = element_blank(), legend.text = element_text(size = 22),
+        legend.position = c(0.8, 0.85))
+save_fig(p1f, "Fig1F_celltype_proportions_95CI.png", 38, 22, fig_dir)
+
+p1f
+```
+
+## Fig. S7 - Patient-level cell-type proportions by EAA status
+
+Per cell type, patient-level percentages of accelerated and decelerated plaques
+were compared with a Wilcoxon rank-sum test.
+
+```{r figS7, fig.width=14, fig.height=12}
+cell_counts %>%
+  group_by(Cell_Type) %>%
+  summarise(p_wilcox = wilcox.test(Percentage ~ EAA_Status, exact = FALSE)$p.value)
+
+p_s7 <- ggplot(cell_counts, aes(x = EAA_Status, y = Percentage, fill = EAA_Status)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+  facet_wrap(~ Cell_Type, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = col_EAA) +
+  stat_compare_means(aes(label = after_stat(p.format)), method = "wilcox.test",
+                     method.args = list(exact = FALSE), comparisons = list(c("Accelerated", "Decelerated")),
+                     label.y.npc = 0.9, size = 4) +
+  labs(x = "", y = "Proportion (%)") +
+  theme_minimal(base_size = 14) +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1), legend.position = "none")
+save_fig(p_s7, "FigS7_celltype_proportions_boxplots.png", 35, 30, fig_dir)
+p_s7
+```
+
+# 10. Differential expression between accelerated and decelerated plaques (MAST)
+
+Within each major cell group, accelerated vs decelerated nuclei were compared with
+Seurat `FindMarkers` (MAST), with sex and sequencing batch as latent variables
+(defaults: min.pct = 0.1, logfc.threshold = 0.25). In all comparisons
+`ident.1` = accelerated, so a positive log2FC means higher expression in
+accelerated plaques. DEGs: BH-adjusted P < 0.01 (|log2FC| >= 0.25 is implied by
+`logfc.threshold`); this threshold is used for the figures, tables and enrichment.
+
+```{r deg-mast}
+Idents(merged_plaque) <- "CellGroup_EAA"
+
+run_mast <- function(group) {
+  FindMarkers(merged_plaque, ident.1 = paste0(group, "_Accelerated"), ident.2 = paste0(group, "_Decelerated"),
+              test.use = "MAST", latent.vars = c("Sex", "batch"))
+}
+
+deg_groups <- list(
+  Macrophages = run_mast("Macrophages"),
+  SMCs        = run_mast("SMCs"),
+  ECs         = run_mast("ECs"),
+  T_cells     = run_mast("CD96+CD247+ T cells"),
+  Neuron_like = run_mast("CNTNAP2+ Neuron-like cells"))
+saveRDS(deg_groups, file.path(params$out_dir, "DEG_MAST_cell_groups.rds"))
+
+padj_thresh <- 0.01
+
+# DEG table for the supplement (also the gene sets used for enrichment)
+deg_all <- bind_rows(lapply(names(deg_groups), function(g) {
+  deg_groups[[g]] %>% rownames_to_column("Gene") %>%
+    filter(p_val_adj < padj_thresh, avg_log2FC != 0) %>%
+    mutate(Cell_Group = g, Direction = ifelse(avg_log2FC > 0, "Accelerated", "Decelerated")) %>%
+    dplyr::select(Cell_Group, Direction, Gene, everything())
+}))
+```
+
+## Fig. 2A/E - UMAPs of ECs and SMCs; Fig. 2B/F - volcano plots
+
+```{r fig2-volcano-umap, fig.width=14, fig.height=7}
+umap_subset <- function(group) {
+  DimPlot(subset(merged_plaque, subset = Cell_Group == group), reduction = "umap.harmony",
+          group.by = "EAA.dich", cols = col_EAA, pt.size = 1.2) +
+    xlab("UMAP Harmony 1") + ylab("UMAP Harmony 2") + ggtitle(NULL) +
+    theme(axis.title = element_text(size = 20), legend.text = element_text(size = 20)) +
+    guides(colour = guide_legend(override.aes = list(size = 8)))
+}
+
+volcano_sn <- function(de, xlim, xlab = expression(Log[2]~fold~change~"(Accelerated vs Decelerated)")) {
+  plot_volcano(de, x = "avg_log2FC", y = "p_val_adj", lab = rownames(de), p_cut = padj_thresh,
+               select_lab = top_genes_sn(de, p_cut = padj_thresh), xlim = xlim, xlab = xlab,
+               ylab = expression(-Log[10]~adjusted~italic(P)))
+}
+
+p2a <- umap_subset("ECs");  p2b <- volcano_sn(deg_groups$ECs,  c(-8, 8))
+p2e <- umap_subset("SMCs"); p2f <- volcano_sn(deg_groups$SMCs, c(-6, 6))
+
+save_fig(p2a, "Fig2A_UMAP_ECs.png", 20, 18, fig_dir)
+save_fig(p2b, "Fig2B_volcano_ECs.png", 18, 20, fig_dir)
+save_fig(p2e, "Fig2E_UMAP_SMCs.png", 20, 18, fig_dir)
+save_fig(p2f, "Fig2F_volcano_SMCs.png", 18, 20, fig_dir)
+
+cowplot::plot_grid(p2b, p2f)
+```
+
+## Fig. S8 - Macrophages, T cells and neuron-like cells
+
+```{r figS8, fig.width=14, fig.height=18}
+p_s8 <- list(
+  A_umap    = umap_subset("Macrophages"),
+  A_volcano = volcano_sn(deg_groups$Macrophages, c(-6, 6)),
+  B_umap    = umap_subset("CD96+CD247+ T cells"),
+  B_volcano = volcano_sn(deg_groups$T_cells, c(-10, 10)),
+  C_umap    = umap_subset("CNTNAP2+ Neuron-like cells"),
+  C_volcano = volcano_sn(deg_groups$Neuron_like, c(-8, 8)))
+for (nm in names(p_s8)) {
+  save_fig(p_s8[[nm]], paste0("FigS8", nm, ".png"), if (grepl("umap", nm)) 20 else 18,
+           if (grepl("umap", nm)) 18 else 20, fig_dir)
+}
+cowplot::plot_grid(plotlist = p_s8, ncol = 2)
+```
+
+## Fig. S9 - Top 10 genes upregulated in accelerated plaques, per patient
+
+To show that the DEGs are consistent across patients and not driven by a single
+patient, the top 10 genes upregulated in accelerated plaques (ordered by P, Table
+S5) are shown per patient for ECs and SMCs. Colour: mean log-normalised
+expression per patient, z-scored per gene across patients; size: percentage of
+nuclei expressing the gene. Patients are labelled anonymously (Acc 1-3, Dec 1-5).
+
+```{r figS9, fig.width=14, fig.height=5.5}
+top_genes <- list(
+  ECs  = c("BMP6", "SULF1", "COL8A1", "PKHD1L1", "PCDH7", "MECOM", "PTGIS", "MEIS2", "NRG1", "NLGN1"),
+  SMCs = c("CALD1", "MYH11", "UACA", "TPM1", "FOS", "AEBP1", "JUN", "PNISR", "LMOD1", "DDX17"))
+
+# Check against the DEG results: top 10 upregulated genes by P
+lapply(deg_groups[c("ECs", "SMCs")], function(de) {
+  head(rownames(de)[de$avg_log2FC > 0][order(de$p_val[de$avg_log2FC > 0])], 10)
+})
+
+group_cols <- c(Accelerated = "#B2182B", Decelerated = "#2166AC")
+
+summarise_per_patient <- function(cell_group, genes) {
+  sub <- subset(merged_plaque, subset = Cell_Group == cell_group)
+  genes <- genes[genes %in% rownames(sub)]
+  long <- FetchData(sub, vars = c(genes, "patient", "EAA.dich")) %>%     # log-normalised expression
+    mutate(EAA.dich = factor(EAA.dich, levels = c("Accelerated", "Decelerated"))) %>%
+    pivot_longer(cols = all_of(genes), names_to = "Gene", values_to = "Expr")
+
+  summ <- long %>%
+    group_by(Gene, patient, EAA.dich) %>%
+    summarise(Mean_expr = mean(Expr), Pct_expr = 100 * mean(Expr > 0), N_cells = n(), .groups = "drop") %>%
+    group_by(Gene) %>% mutate(Scaled_expr = as.numeric(scale(Mean_expr))) %>% ungroup()
+
+  # anonymous patient labels, accelerated first
+  pat_key <- summ %>% distinct(patient, EAA.dich) %>% arrange(EAA.dich, patient) %>%
+    group_by(EAA.dich) %>% mutate(Label = paste(substr(as.character(EAA.dich), 1, 3), row_number())) %>%
+    ungroup()
+  summ$patient <- factor(pat_key$Label[match(summ$patient, pat_key$patient)], levels = pat_key$Label)
+  long$patient <- factor(pat_key$Label[match(long$patient, pat_key$patient)], levels = pat_key$Label)
+  summ$Gene <- factor(summ$Gene, levels = rev(genes))
+  long$Gene <- factor(long$Gene, levels = genes)
+  list(summary = summ, cells = long)
+}
+
+plot_dot <- function(summ, cell_group) {
+  ggplot(summ, aes(x = patient, y = Gene)) +
+    geom_point(aes(size = Pct_expr, colour = Scaled_expr)) +
+    scale_colour_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+                           name = "Mean expression\n(z-score)") +
+    scale_size_continuous(range = c(0.5, 6), limits = c(0, 100), name = "% cells\nexpressing") +
+    facet_grid(. ~ EAA.dich, scales = "free_x", space = "free_x") +
+    labs(title = sprintf("%s: top 10 genes upregulated in accelerated plaques", cell_group),
+         x = "Patient", y = NULL) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          strip.text = element_text(face = "bold", colour = "white"),
+          strip.background = element_rect(fill = "grey30"), panel.grid = element_blank())
+}
+
+plot_violin <- function(cells, summ, cell_group) {
+  n_lab <- summ %>% distinct(patient, N_cells)
+  ggplot(cells, aes(x = patient, y = Expr, fill = EAA.dich)) +
+    geom_violin(scale = "width", linewidth = 0.2, colour = "grey30") +
+    stat_summary(fun = mean, geom = "point", size = 1, colour = "black") +
+    scale_fill_manual(values = group_cols, name = "Plaque EAA") +
+    facet_wrap(~ Gene, ncol = 5, scales = "free_y") +
+    labs(title = sprintf("%s: per-cell expression of top 10 genes per patient", cell_group),
+         subtitle = paste("Cells per patient:", paste(sprintf("%s = %d", n_lab$patient, n_lab$N_cells), collapse = ", ")),
+         x = "Patient", y = "Log-normalized expression") +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7), legend.position = "bottom",
+          plot.subtitle = element_text(size = 8), panel.grid.major.x = element_blank())
+}
+
+dot_plots <- list()
+for (cg in names(top_genes)) {
+  res <- summarise_per_patient(cg, top_genes[[cg]])
+  dot_plots[[cg]] <- plot_dot(res$summary, cg)
+  save_fig(plot_violin(res$cells, res$summary, cg), sprintf("FigS9_%s_violin_per_patient.png", cg),
+           12, 6, fig_dir, units = "in")
+  write.csv(arrange(res$summary, Gene, patient),
+            file.path(tab_dir, sprintf("FigS9_%s_expression_per_patient.csv", cg)), row.names = FALSE)
+}
+
+p_s9 <- dot_plots$ECs + dot_plots$SMCs + plot_layout(ncol = 2, guides = "collect") +
+  plot_annotation(tag_levels = "A")
+save_fig(p_s9, "FigS9_top10_ECs_SMCs_dotplot_per_patient.png", 14, 5.5, fig_dir, units = "in")
+p_s9
+```
+
+# 11. Functional enrichment (Enrichr; Table S6, Fig. 2C-D, G-H)
+
+Genes up- or downregulated with adjusted P < 0.01 were tested against GO (MF,
+CC, BP 2025), Reactome 2024, KEGG 2021 Human and MSigDB Hallmark 2020, using all
+genes tested in the respective cell group as background.
+
+```{r enrichment}
+init_enrichr()
+
+# Enrichr is only run for gene sets with >= 2 genes
+safe_enrichr <- function(genes, background) {
+  if (length(genes) < 2) return(NULL)
+  tryCatch(run_enrichr(genes, background), error = function(e) { message("Enrichment failed: ", e$message); NULL })
+}
+
+enrich_sn <- list()
+for (g in names(deg_groups)) {
+  de <- deg_groups[[g]]
+  enrich_sn[[paste0(g, "_Up")]]   <- safe_enrichr(rownames(de)[de$p_val_adj < 0.01 & de$avg_log2FC > 0], rownames(de))
+  enrich_sn[[paste0(g, "_Down")]] <- safe_enrichr(rownames(de)[de$p_val_adj < 0.01 & de$avg_log2FC < 0], rownames(de))
+}
+saveRDS(enrich_sn, file.path(params$out_dir, "enrichr_cell_groups.rds"))
+
+# Supplementary table: terms with nominal P < 0.05 (or "No significant enrichment")
+db_labels <- c(GO_Molecular_Function_2025 = "GO_Molecular_Function", GO_Cellular_Component_2025 = "GO_Cellular_Component",
+               GO_Biological_Process_2025 = "GO_Biological_Process", Reactome_Pathways_2024 = "Reactome",
+               KEGG_2021_Human = "KEGG", MSigDB_Hallmark_2020 = "Hallmark")
+
+directions <- c(Up = "Accelerated", Down = "Decelerated")
+enrichment_all <- bind_rows(lapply(names(deg_groups), function(g) {
+  bind_rows(lapply(names(directions), function(d) {
+    direction <- directions[[d]]
+    res <- enrich_sn[[paste0(g, "_", d)]]
+    bind_rows(lapply(names(db_labels), function(db) {
+      df <- if (!is.null(res)) as.data.frame(res[[db]]) else NULL
+      if (is.null(df) || nrow(df) == 0) {
+        return(data.frame(Cell_Group = g, Enrichment_Type = direction, Database = db_labels[[db]],
+                          Term = "No significant enrichment", P.value = NA, Adjusted.P.value = NA))
+      }
+      df %>% filter(P.value < 0.05) %>%
+        mutate(Cell_Group = g, Enrichment_Type = direction, Database = db_labels[[db]]) %>%
+        dplyr::select(Cell_Group, Enrichment_Type, Database, everything())
+    }))
+  }))
+}))
+
+summary_all <- full_join(
+  deg_all %>% count(Cell_Group, Direction, name = "Number_of_DEGs"),
+  enrichment_all %>% filter(Term != "No significant enrichment") %>%
+    count(Cell_Group, Direction = Enrichment_Type, name = "Significant_Enrichment_Terms"),
+  by = c("Cell_Group", "Direction"))
+
+wb <- createWorkbook()
+for (sheet in c("Summary", "DEG_All_Groups", "Enrichment_All_Groups")) addWorksheet(wb, sheet)
+writeData(wb, "Summary", summary_all)
+writeData(wb, "DEG_All_Groups", deg_all)
+writeData(wb, "Enrichment_All_Groups", enrichment_all)
+for (sheet in names(wb)) {
+  freezePane(wb, sheet, firstRow = TRUE)
+  setColWidths(wb, sheet, cols = 1:20, widths = "auto")
+  addStyle(wb, sheet, createStyle(textDecoration = "bold"), rows = 1, cols = 1:30, gridExpand = TRUE)
+}
+saveWorkbook(wb, file.path(tab_dir, "TablesS5-S6_DEG_and_Enrichment_all_celltypes.xlsx"), overwrite = TRUE)
+summary_all
+```
+
+The terms shown in the figure panels were selected from the full result tables
+(Table S6) for display; shortened term names are used in the plots.
+
+```{r fig2-enrichment, fig.width=14, fig.height=10}
+# Fig. 2C - ECs, GO Cellular Component
+ec_cc <- enrich_sn$ECs_Up$GO_Cellular_Component_2025 %>% strip_go_id() %>%
+  filter(Term %in% c("Collagen-Containing Extracellular Matrix", "Endoplasmic Reticulum Lumen",
+                     "Spherical High-Density Lipoprotein Particle", "Platelet Alpha Granule")) %>%
+  mutate(Term = recode(Term,
+    "Collagen-Containing Extracellular Matrix"    = "Collagen-Containing ECM",
+    "Endoplasmic Reticulum Lumen"                 = "ER Lumen",
+    "Spherical High-Density Lipoprotein Particle" = "sHDL particle",
+    "Platelet Alpha Granule"                      = "Platelet Granule"))
+p2c <- plot_enrichment(ec_cc, title = "ECs GO Cellular Component", inside_n = 1)
+
+# Fig. 2D - ECs, Reactome (+ KEGG TGF-beta signaling)
+ec_path <- bind_rows(
+  enrich_sn$ECs_Up$Reactome_Pathways_2024 %>%
+    filter(Term %in% c("Platelet Degranulation", "Platelet Activation, Signaling and Aggregation",
+                       "Response to Elevated Platelet Cytosolic Ca2+", "Elastic Fibre Formation",
+                       "Extracellular Matrix Organization", "Hemostasis")),
+  enrich_sn$ECs_Up$KEGG_2021_Human %>% filter(Term == "TGF-beta signaling pathway")) %>%
+  mutate(Term = recode(Term,
+    "Platelet Degranulation"                         = "Platelet degranulation",
+    "Platelet Activation, Signaling and Aggregation" = "Platelet activation/aggregation",
+    "Response to Elevated Platelet Cytosolic Ca2+"   = "Platelet Ca²⁺ response",
+    "Elastic Fibre Formation"                        = "Elastic fiber formation",
+    "Extracellular Matrix Organization"              = "ECM organization",
+    "TGF-beta signaling pathway"                     = "TGF-β pathway"))
+p2d <- plot_enrichment(ec_path, title = "ECs Reactome 2024", inside_n = 7)
+
+# Fig. 2G - SMCs, GO Cellular Component (rows selected from the ranked result table)
+smc_cc <- enrich_sn$SMCs_Up$GO_Cellular_Component_2025[c(1, 2, 4, 5, 7, 9), ] %>% strip_go_id()
+p2g <- plot_enrichment(smc_cc, title = "SMCs GO Cellular Component", n_terms = 6, inside_n = 3)
+
+# Fig. 2H - SMCs, MSigDB Hallmark
+smc_hallmark <- enrich_sn$SMCs_Up$MSigDB_Hallmark_2020[1:6, ] %>%
+  mutate(Term = recode(Term, "Epithelial Mesenchymal Transition" = "EMT"))
+p2h <- plot_enrichment(smc_hallmark, title = "SMCs MSigDB Hallmark", inside_n = 2)
+
+save_fig(p2c, "Fig2C_enrich_EC_GOCC.png", 16, 18, fig_dir)
+save_fig(p2d, "Fig2D_enrich_EC_Reactome.png", 24, 18, fig_dir)
+save_fig(p2g, "Fig2G_enrich_SMC_GOCC.png", 20, 18, fig_dir)
+save_fig(p2h, "Fig2H_enrich_SMC_Hallmark.png", 18, 18, fig_dir)
+cowplot::plot_grid(p2c, p2d, p2g, p2h, ncol = 2)
+```
+
+# 12. Sensitivity analysis: patient-level pseudobulk (Tables S7-S8)
+
+RNA counts were aggregated per patient within each cell group
+(`AggregateExpression`), and accelerated vs decelerated pseudobulk profiles were
+compared (MAST, sex and batch as latent variables). Table S8 lists genes with
+nominal P < 0.05 and |log2FC| >= 0.25.
+
+```{r pseudobulk}
+pseudo <- AggregateExpression(merged_plaque, group.by = c("Cell_Group", "EAA.dich", "patient", "Sex", "batch"),
+                              assays = "RNA", return.seurat = TRUE)
+pseudo$group_label <- paste(pseudo$Cell_Group, pseudo$EAA.dich, sep = "_")
+Idents(pseudo) <- "group_label"
+table(Idents(pseudo))
+
+pb_groups <- c(ECs = "ECs", SMCs = "SMCs", Macrophages = "Macrophages",
+               T_cells = "CD96+CD247+ T cells", Neuron_like = "CNTNAP2+ Neuron-like cells")
+
+pb_results <- lapply(pb_groups, function(g) {
+  FindMarkers(pseudo, ident.1 = paste0(g, "_Accelerated"), ident.2 = paste0(g, "_Decelerated"),
+              test.use = "MAST", latent.vars = c("Sex", "batch"))
+})
+
+pb_all <- bind_rows(lapply(names(pb_results), function(g) {
+  pb_results[[g]] %>% rownames_to_column("gene") %>%
+    mutate(Cell_Group = g, Direction = ifelse(avg_log2FC > 0, "Accelerated", "Decelerated"), .before = 1)
+}))
+pb_sig <- pb_all %>% filter(p_val < 0.05, abs(avg_log2FC) >= 0.25) %>% arrange(Cell_Group, Direction, p_val)
+pb_summary <- pb_sig %>% count(Cell_Group, Direction, name = "Number_of_DEGs") %>%
+  complete(Cell_Group = names(pb_groups), Direction = c("Accelerated", "Decelerated"),
+           fill = list(Number_of_DEGs = 0))
+
+write.xlsx(list(DEG_summary = pb_summary, Significant_DEGs = pb_sig, All_DE_results = pb_all),
+           file.path(tab_dir, "TablesS7-S8_pseudobulk_DEG.xlsx"))
+pb_summary
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
