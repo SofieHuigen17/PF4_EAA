@@ -18,3 +18,7 @@ output/
 *_files/
 *.html
 VennDiagram*.log
+
+# Kept locally, not part of the first submission
+lumen_annotation/
+R/check_package_versions.R

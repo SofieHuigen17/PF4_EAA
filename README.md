@@ -37,12 +37,8 @@ notebook 04 uses the responsive gene sets from 03:
 ├── 02_proteomics_EAA.Rmd
 ├── 03_EC_PF4_TGFb_stimulation_and_overlap.Rmd
 ├── 04_spatial_Xenium.Rmd
-├── R/
-│   └── helper_functions.R         # shared plotting / enrichment / overlap functions
-└── lumen_annotation/              # manual lumen boundaries + cut-offs (Xenium, notebook 04)
-    ├── export_lumen_annotation.R
-    ├── lumen_boundaries.rds / .csv
-    └── lumen_cutoffs.csv
+└── R/
+    └── helper_functions.R         # shared plotting / enrichment / overlap functions
 ```
 
 Each notebook writes its figures and tables to `output/<notebook>/figures` and
@@ -77,8 +73,7 @@ top of every notebook.
 | dplyr / tidyr / openxlsx / tableone / rmarkdown | 1.2.1 / 1.3.2 / 4.2.8 / 0.13.2 / 2.32 | all |
 
 The exact versions of all packages are reported in the `sessionInfo()` output at
-the end of each rendered notebook, and can be listed with
-`source("R/check_package_versions.R")`.
+the end of each rendered notebook.
 
 Upstream processing (not part of this repository): CeleScope v2.9.0 (snRNA-seq
 alignment, GRCh38/Ensembl 99), BWA v0.7.13 (CEL-Seq2 bulk RNA-seq, Ensembl v84),
@@ -106,7 +101,7 @@ remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
 > ```
 >
 > Downstream analyses (differential expression, enrichment, figures) were run
-> with R 4.5.1 / Bioconductor 3.21 (see `R/check_package_versions.R`).
+> with R 4.5.1 / Bioconductor 3.21.
 
 Typical installation time: ~30-60 min on a standard desktop computer.
 

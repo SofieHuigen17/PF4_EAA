@@ -126,10 +126,11 @@ boundary point was computed. Because distance distributions differ between
 samples, the cut-off was set per sample at the separation in the distance
 histogram (Fig. S11). ECs closer than the cut-off are *lumen-adjacent*.
 
-The traced boundaries and cut-offs used in the manuscript are provided in
-`lumen_annotation/` so that the classification is fully reproducible without
-redrawing. Set `params$redraw_lumen = TRUE` to repeat the interactive annotation
-(requires an interactive graphics device; not run when knitting).
+The traced boundaries (`lumen_boundaries.rds`) and per-sample cut-offs
+(`lumen_cutoffs.csv`) used in the manuscript are read from `params$lumen_dir`
+and are available from the authors upon request. Set `params$redraw_lumen = TRUE`
+to repeat the interactive annotation (requires an interactive graphics device;
+not run when knitting).
 
 ```{r draw-lumen, eval=params$redraw_lumen}
 lumen_boundaries <- list()
